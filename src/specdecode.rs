@@ -42,6 +42,7 @@ impl SpecStats {
 /// Run greedy speculative decode. `prompt` is the committed prefix; the driver prefills it
 /// into the chain, then generates up to `cfg.max_new` tokens. Returns the generated tokens
 /// (excluding the prompt) plus telemetry.
+#[allow(dead_code)] // the synchronous reference driver — used by tests + the CUDA check
 pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     draft: &mut D,
     target: &mut T,

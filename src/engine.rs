@@ -27,6 +27,7 @@ pub trait DraftEngine {
 /// In production a single call here fans the hidden state out across the shard chain over
 /// QUIC and reads the result back; here it is a trait so the driver stays substrate- and
 /// transport-agnostic.
+#[allow(dead_code)] // truncate/is_eos are driver-facing; the CLI path only uses the pipelined driver
 pub trait TargetChain {
     /// Prefill `prompt` into the chain's (per-shard) KV — leaving each shard's cache
     /// holding positions `[0, prompt.len())` — and return the target's greedy argmax for
