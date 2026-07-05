@@ -1,0 +1,58 @@
+[package]
+name = "potpori"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Sharded LLM inference with your friends over WAN — pipeline-parallel + lossless speculative decoding on Luminal"
+repository = "https://github.com/andthattoo/potpori"
+
+[[bin]]
+name = "potpori"
+path = "src/main.rs"
+
+[features]
+default = []
+# Inference-engine deps (Luminal model graph + safetensors weight loading + tokenizer);
+# enabled by a backend feature.
+engine = [
+    "dep:luminal_nn",
+    "dep:hf-hub",
+    "dep:safetensors",
+    "dep:half",
+    "dep:bytemuck",
+    "dep:memmap2",
+    "dep:tokenizers",
+    "dep:serde_json",
+]
+# Backend selectors: pull in the Luminal backend crate (+ the engine deps) for the accelerator.
+cuda = ["dep:luminal_cuda_lite", "engine"]
+metal = ["dep:luminal_metal", "engine"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Compute substrate: Luminal, pinned to the validated upstream rev (crates.io ships the older
+# pre-egglog-rewrite release). The core graph lib is always built; backend crates are optional.
+luminal = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd" }
+luminal_metal = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
+luminal_cuda_lite = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
+luminal_nn = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
+
+# Model weight loading + tokenizer, behind the `engine` feature.
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"], optional = true }
+safetensors = { version = "0.7", optional = true }
+half = { version = "2.7", features = ["bytemuck"], optional = true }
+bytemuck = { version = "1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true }
+serde_json = { version = "1", optional = true }

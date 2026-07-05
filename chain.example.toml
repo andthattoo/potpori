@@ -1,0 +1,29 @@
+# potpori chain config — copy to chain.toml and edit.
+#
+# The FIRST node is the head: it runs locally inside `potpori chat` (embeddings + its layer
+# block + the draft model + tokenizer). Every other node is remote, in pipeline order; the
+# LAST one is the tail (final norm + lm_head). Layer ranges must be contiguous.
+#
+# Each remote friend runs `potpori serve` with a matching layer range, e.g. for this file:
+#   friend A (middle): potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
+#                        --layers 12:24 --role middle --downstream 100.64.0.3:4010 --chunk 8
+#   friend B (tail):   potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
+#                        --layers 24:36 --role tail --chunk 8
+# (--chunk must equal gamma+1; --max-seq must match max_seq.)
+
+model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for now)
+draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
+gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
+max_seq = 2048                    # KV size on every shard
+depth = 4                         # in-flight verify chunks (pipelining; hides WAN RTT)
+
+[[nodes]]          # head — this machine (potpori chat)
+layers = [0, 12]
+
+[[nodes]]          # friend A — middle
+addr = "100.64.0.2:4010"
+layers = [12, 24]
+
+[[nodes]]          # friend B — tail
+addr = "100.64.0.3:4010"
+layers = [24, 36]
