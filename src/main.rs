@@ -243,6 +243,25 @@ mod run {
         let tok = ChatTokenizer::load(&cc.model)?;
         let ids = tok.encode_chat(&prompt)?;
 
+        let (dcfg, dwp) = weights_for(&cc.draft_model)?;
+        tracing::info!("loading draft model {}…", cc.draft_model);
+        let mut draft_target =
+            QwenTarget::load(new_runtime(), dcfg, &dwp, cc.max_seq, cc.search_graphs);
+        {
+            // Sanity forward: all-NaN logits argmax to token 0 (e.g. the Luminal generic-bucket
+            // miscompile at large max_seq). Catch it here, not as silent 0-acceptance.
+            use crate::engine::TargetChain as _;
+            let t = draft_target.prefill(&ids);
+            if t == 0 {
+                bail!(
+                    "draft sanity check failed: first prediction is token 0 (all-NaN logits?). \
+                     Known cause: max_seq too large for Luminal's generic kernel bucket \
+                     (2048 miscompiles; 512 is known-good). Lower max_seq in the chain config."
+                );
+            }
+            tracing::info!("draft sanity check ok (first prediction = {t})");
+        }
+
         let (tcfg, twp) = weights_for(&cc.model)?;
         let head_range = (cc.nodes[0].layers[0], cc.nodes[0].layers[1]);
         tracing::info!(
@@ -262,11 +281,6 @@ mod run {
             cc.search_graphs,
             chunk,
         );
-
-        let (dcfg, dwp) = weights_for(&cc.draft_model)?;
-        tracing::info!("loading draft model {}…", cc.draft_model);
-        let draft_target =
-            QwenTarget::load(new_runtime(), dcfg, &dwp, cc.max_seq, cc.search_graphs);
         let mut draft = IncrementalDraft::new(draft_target);
 
         let next_addr: SocketAddr = cc.nodes[1]

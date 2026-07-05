@@ -45,6 +45,9 @@ impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
         // for position n (absolute-position overwrite makes the re-feed harmless).
         let start = agree.min(n.saturating_sub(1));
 
+        if std::env::var("POTPORI_DEBUG").is_ok() && n < 120 {
+            eprintln!("[dbg-draft] n={n} agree={agree} start={start} tail_ctx={:?}", &context[n.saturating_sub(3)..]);
+        }
         let mut cur = if start == 0 {
             self.model.prefill(context)
         } else {

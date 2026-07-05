@@ -14,7 +14,9 @@
 model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for now)
 draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
 gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
-max_seq = 2048                    # KV size on every shard
+max_seq = 512                     # KV size on every shard. CAUTION: 2048 currently
+                                  # miscompiles Luminal's generic kernel bucket (all-NaN
+                                  # draft) — keep ≤768 until fixed upstream
 depth = 4                         # in-flight verify chunks (pipelining; hides WAN RTT)
 
 [[nodes]]          # head — this machine (potpori chat)

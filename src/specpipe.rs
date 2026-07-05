@@ -85,6 +85,13 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
         let r = chain.poll();
         let ds = inflight.pop_front().unwrap();
         traversals += 1;
+        if std::env::var("POTPORI_DEBUG").is_ok() && traversals <= 14 {
+            eprintln!(
+                "[dbg] trav={traversals} ds[..3]={:?} r[..3]={:?} discard_pending={discard}",
+                &ds[..ds.len().min(3)],
+                &r[..r.len().min(3)]
+            );
+        }
         if discard > 0 {
             discard -= 1; // stale (post-divergence or post-terminal) → skip
             continue;
