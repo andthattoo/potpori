@@ -245,22 +245,14 @@ mod run {
 
         let (dcfg, dwp) = weights_for(&cc.draft_model)?;
         tracing::info!("loading draft model {}…", cc.draft_model);
-        let mut draft_target =
-            QwenTarget::load(new_runtime(), dcfg, &dwp, cc.max_seq, cc.search_graphs);
-        {
-            // Sanity forward: all-NaN logits argmax to token 0 (e.g. the Luminal generic-bucket
-            // miscompile at large max_seq). Catch it here, not as silent 0-acceptance.
-            use crate::engine::TargetChain as _;
-            let t = draft_target.prefill(&ids);
-            if t == 0 {
-                bail!(
-                    "draft sanity check failed: first prediction is token 0 (all-NaN logits?). \
-                     Known cause: max_seq too large for Luminal's generic kernel bucket \
-                     (2048 miscompiles; 512 is known-good). Lower max_seq in the chain config."
-                );
-            }
-            tracing::info!("draft sanity check ok (first prediction = {t})");
-        }
+        let draft_target = QwenTarget::load_chunked(
+            new_runtime(),
+            dcfg,
+            &dwp,
+            cc.max_seq,
+            cc.search_graphs,
+            chunk, // point buckets {1, γ+1} — the generic dynamic bucket miscompiles on Metal
+        );
 
         let (tcfg, twp) = weights_for(&cc.model)?;
         let head_range = (cc.nodes[0].layers[0], cc.nodes[0].layers[1]);
@@ -281,7 +273,20 @@ mod run {
             cc.search_graphs,
             chunk,
         );
-        let mut draft = IncrementalDraft::new(draft_target);
+        let mut draft = IncrementalDraft::new(draft_target, chunk);
+        {
+            // Sanity: all-NaN logits argmax to token 0. Probe with a 1-token draft (this also
+            // warm-feeds the prompt into the draft's KV — not wasted work).
+            use crate::engine::DraftEngine as _;
+            let probe = draft.draft(&ids, 1);
+            if probe[0] == 0 {
+                bail!(
+                    "draft sanity check failed: first prediction is token 0 (all-NaN logits?). \
+                     A Luminal kernel for this config miscompiled — try a different max_seq."
+                );
+            }
+            tracing::info!("draft sanity check ok (first prediction = {})", probe[0]);
+        }
 
         let next_addr: SocketAddr = cc.nodes[1]
             .addr

@@ -116,11 +116,28 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
     /// Build the graph, run the egglog search, and load the bf16 weights. `weights_path` is
     /// the combined safetensors produced by `super::hf::prepare_hf_model`.
     pub fn load(
+        runtime: R,
+        cfg: QwenConfig,
+        weights_path: &str,
+        max_seq_len: usize,
+        search_graphs: usize,
+    ) -> Self {
+        Self::load_chunked(runtime, cfg, weights_path, max_seq_len, search_graphs, 0)
+    }
+
+    /// Like [`load`](Self::load), but `chunk_size > 1` compiles POINT s-buckets
+    /// `[1,1] + [chunk_size,chunk_size]` instead of the generic dynamic `[2,max]` range.
+    /// Point buckets are the only s-values the egglog search actually VALIDATES (NaN-checked at
+    /// the representative — which for a point bucket is the only runtime size); the dynamic
+    /// bucket is validated at s=8 only and has produced miscompiled (all-NaN) kernels at other
+    /// sizes on Metal. Callers must then only feed s ∈ {1, chunk_size}.
+    pub fn load_chunked(
         mut runtime: R,
         cfg: QwenConfig,
         weights_path: &str,
         max_seq_len: usize,
         search_graphs: usize,
+        chunk_size: usize,
     ) -> Self {
         let mut cx = Graph::default();
         let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
@@ -135,29 +152,30 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
 
         // Compile once across the seq-len ('s') and past-len ('p') ranges we will use.
         let search_s = 8usize;
-        let compile_options = CompileOptions::default()
-            .dim_buckets(
-                's',
-                &[DimBucket::new(1, 1), DimBucket::new(2, max_seq_len).representative(search_s)],
-            )
-            .dim_buckets(
-                'p',
-                &[DimBucket::new(0, 0), DimBucket::new(1, max_seq_len).representative(search_s)],
-            );
+        let s_buckets = if chunk_size <= 1 {
+            vec![DimBucket::new(1, 1), DimBucket::new(2, max_seq_len).representative(search_s)]
+        } else {
+            vec![DimBucket::new(1, 1), DimBucket::new(chunk_size, chunk_size)]
+        };
+        let rep_s = if chunk_size <= 1 { search_s } else { chunk_size };
+        let compile_options = CompileOptions::default().dim_buckets('s', &s_buckets).dim_buckets(
+            'p',
+            &[DimBucket::new(0, 0), DimBucket::new(1, max_seq_len).representative(search_s)],
+        );
         cx.build_search_space::<R>(compile_options);
         runtime.load_safetensors(&cx, weights_path);
 
-        let cache_bytes = cfg.n_kv_heads * max_seq_len * cfg.head_dim * 2; // F16
+        let cache_bytes = cfg.n_kv_heads * max_seq_len * cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..cfg.layers {
             runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
             runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
         }
 
         // Search needs representative inputs present (it executes candidate genomes).
-        cx.set_dim('s', search_s);
+        cx.set_dim('s', rep_s);
         cx.set_dim('p', 0);
-        runtime.set_i32_data(input.id, vec![1; search_s]);
-        runtime.set_i32_data(pos_ids.id, (0..search_s as i32).collect());
+        runtime.set_i32_data(input.id, vec![1; rep_s]);
+        runtime.set_i32_data(pos_ids.id, (0..rep_s as i32).collect());
         let search_options = CompileOptions::default().search_graph_limit(search_graphs);
         runtime = cx.search(runtime, search_options);
 
@@ -193,7 +211,7 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
 
     /// Zero the per-layer KV cache (e.g. between two independent generations).
     pub fn reset(&mut self) {
-        let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * 2;
+        let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..self.cfg.layers {
             self.runtime.set_zeros(self.kv_cache.k_caches[i].id, cache_bytes);
             self.runtime.set_zeros(self.kv_cache.v_caches[i].id, cache_bytes);

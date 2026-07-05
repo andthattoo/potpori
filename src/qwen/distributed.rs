@@ -282,8 +282,22 @@ impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let (endpoint, peer) = rt.block_on(async move {
             let ep = dial_endpoint()?;
-            let peer = dial(&ep, tail_addr).await?;
-            io::Result::Ok((ep, peer))
+            // Peers come up at different times (their kernel search takes minutes) — retry
+            // with backoff for up to ~10 minutes instead of failing on the first dial.
+            let mut last_err = None;
+            for attempt in 0..120u32 {
+                match dial(&ep, tail_addr).await {
+                    Ok(peer) => return io::Result::Ok((ep, peer)),
+                    Err(e) => {
+                        if attempt % 12 == 0 {
+                            tracing::info!("waiting for {tail_addr} (still loading?): {e}");
+                        }
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+            Err(last_err.unwrap())
         })?;
         Ok(Self { head, hidden_dim, rt, _endpoint: endpoint, peer, step: 0, prefill_chunk: 0 })
     }

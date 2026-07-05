@@ -16,6 +16,9 @@ use super::target::{QwenRuntime, QwenTarget};
 
 pub struct IncrementalDraft<R: QwenRuntime + 'static> {
     model: QwenTarget<R>,
+    /// Catch-up feeds pieces of exactly this many tokens (+ single-token remainder), matching
+    /// the model's compiled point buckets {1, chunk}. 0/1 = single-token feeds only.
+    chunk: usize,
     /// The exact tokens we have fed at absolute positions `0..fed.len()` (committed AND
     /// speculative). Catch-up only re-feeds positions where the caller's context differs —
     /// so our own speculative feeds (which the pipelined driver echoes back in `context`)
@@ -24,8 +27,22 @@ pub struct IncrementalDraft<R: QwenRuntime + 'static> {
 }
 
 impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
-    pub fn new(model: QwenTarget<R>) -> Self {
-        Self { model, fed: Vec::new() }
+    pub fn new(model: QwenTarget<R>, chunk: usize) -> Self {
+        Self { model, chunk, fed: Vec::new() }
+    }
+
+    /// Feed `ctx[from..to]` at absolute positions `from..to` in point-bucket-sized pieces;
+    /// return the model's prediction for position `to`.
+    fn feed_range(&mut self, ctx: &[TokenId], from: usize, to: usize) -> TokenId {
+        let mut pos = from;
+        let mut last = 0;
+        while pos < to {
+            let take = if self.chunk > 1 && to - pos >= self.chunk { self.chunk } else { 1 };
+            let piece = &ctx[pos..pos + take];
+            last = *self.model.verify(pos as u32, piece[0], &piece[1..]).last().unwrap();
+            pos += take;
+        }
+        last
     }
 }
 
@@ -48,15 +65,7 @@ impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
         if std::env::var("POTPORI_DEBUG").is_ok() && n < 120 {
             eprintln!("[dbg-draft] n={n} agree={agree} start={start} tail_ctx={:?}", &context[n.saturating_sub(3)..]);
         }
-        let mut cur = if start == 0 {
-            self.model.prefill(context)
-        } else {
-            let mut last = 0;
-            for i in start..n {
-                last = self.model.verify(i as u32, context[i], &[])[0];
-            }
-            last
-        };
+        let mut cur = self.feed_range(context, start, n);
         self.fed.truncate(start);
         self.fed.extend_from_slice(&context[start..n]);
 

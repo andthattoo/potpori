@@ -11,7 +11,23 @@ use luminal_nn::LayerNorm;
 /// natively, and loading bf16 bytes into an f16 buffer there yields garbage/NaN — so the CUDA
 /// lane uses Bf16 (matching the safetensors, no conversion). Both are 2 bytes, so the KV layout
 /// is unchanged.
-pub const MAIN_DTYPE: DType = if cfg!(feature = "cuda") { DType::Bf16 } else { DType::F16 };
+pub fn main_dtype() -> DType {
+    static DT: std::sync::OnceLock<DType> = std::sync::OnceLock::new();
+    *DT.get_or_init(|| {
+        if cfg!(feature = "cuda") {
+            DType::Bf16 // CUDA loads the bf16 safetensors natively
+        } else {
+            // Metal has no bf16 load arm → 16-bit means F16. But F16's ±65504 range can
+            // OVERFLOW on Qwen's residual-stream activation outliers (data-dependent NaN on
+            // real prompts), so allow forcing F32 (2× memory, but bf16-like range).
+            match std::env::var("POTPORI_DTYPE").as_deref() {
+                Ok("f16") => DType::F16, // 2× lighter but OVERFLOWS on real prompts — experimental
+                Ok("f32") | Err(_) => DType::F32,
+                Ok(other) => panic!("POTPORI_DTYPE must be f16|f32, got {other}"),
+            }
+        }
+    })
+}
 
 /// Qwen3 model configuration. Parameterized so a small draft (0.6B) and a bigger target
 /// (1.7B/4B) can both load from this one module — and so the GLM-5.2 port can follow the
@@ -89,11 +105,11 @@ impl KVCache {
             // KV cache stored F16 (2 bytes/elem); the scatter writes F16 k_rope/v rows directly.
             k_caches.push(
                 persist(cx, format!("kv_cache.{l}.k"), (cfg.n_kv_heads, max_seq, cfg.head_dim))
-                    .as_dtype(MAIN_DTYPE),
+                    .as_dtype(main_dtype()),
             );
             v_caches.push(
                 persist(cx, format!("kv_cache.{l}.v"), (cfg.n_kv_heads, max_seq, cfg.head_dim))
-                    .as_dtype(MAIN_DTYPE),
+                    .as_dtype(main_dtype()),
             );
         }
         Self { k_caches, v_caches, max_seq }
@@ -111,7 +127,7 @@ impl Qwen {
     pub fn init(cx: &mut Graph, cfg: QwenConfig) -> Self {
         Self {
             embedding: persist(cx, "model.embed_tokens.weight", (cfg.vocab_size, cfg.hidden))
-                .as_dtype(MAIN_DTYPE),
+                .as_dtype(main_dtype()),
             layers: (0..cfg.layers).map(|l| QwenLayer::init(cx, cfg, l)).collect(),
             lm_norm: rms_norm(cx, cfg, "model.norm.weight"),
             cfg,
@@ -166,7 +182,7 @@ impl QwenShard {
     ) -> Self {
         let (a, b) = range;
         let embedding = (is_first || is_last).then(|| {
-            persist(cx, "model.embed_tokens.weight", (cfg.vocab_size, cfg.hidden)).as_dtype(MAIN_DTYPE)
+            persist(cx, "model.embed_tokens.weight", (cfg.vocab_size, cfg.hidden)).as_dtype(main_dtype())
         });
         let layers = (a..b).map(|l| QwenLayer::init(cx, cfg, l)).collect();
         let lm_norm = is_last.then(|| rms_norm(cx, cfg, "model.norm.weight"));
@@ -229,13 +245,13 @@ struct QwenLayer {
 impl QwenLayer {
     fn init(cx: &mut Graph, cfg: QwenConfig, l: usize) -> Self {
         Self {
-            up: layer_weight(cx, l, "mlp.up_proj", (cfg.intermediate, cfg.hidden)).as_dtype(MAIN_DTYPE),
-            gate: layer_weight(cx, l, "mlp.gate_proj", (cfg.intermediate, cfg.hidden)).as_dtype(MAIN_DTYPE),
-            down: layer_weight(cx, l, "mlp.down_proj", (cfg.hidden, cfg.intermediate)).as_dtype(MAIN_DTYPE),
-            q_proj: layer_weight(cx, l, "self_attn.q_proj", (cfg.q_dim(), cfg.hidden)).as_dtype(MAIN_DTYPE),
-            k_proj: layer_weight(cx, l, "self_attn.k_proj", (cfg.kv_dim(), cfg.hidden)).as_dtype(MAIN_DTYPE),
-            v_proj: layer_weight(cx, l, "self_attn.v_proj", (cfg.kv_dim(), cfg.hidden)).as_dtype(MAIN_DTYPE),
-            o_proj: layer_weight(cx, l, "self_attn.o_proj", (cfg.hidden, cfg.q_dim())).as_dtype(MAIN_DTYPE),
+            up: layer_weight(cx, l, "mlp.up_proj", (cfg.intermediate, cfg.hidden)).as_dtype(main_dtype()),
+            gate: layer_weight(cx, l, "mlp.gate_proj", (cfg.intermediate, cfg.hidden)).as_dtype(main_dtype()),
+            down: layer_weight(cx, l, "mlp.down_proj", (cfg.hidden, cfg.intermediate)).as_dtype(main_dtype()),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (cfg.q_dim(), cfg.hidden)).as_dtype(main_dtype()),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (cfg.kv_dim(), cfg.hidden)).as_dtype(main_dtype()),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (cfg.kv_dim(), cfg.hidden)).as_dtype(main_dtype()),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (cfg.hidden, cfg.q_dim())).as_dtype(main_dtype()),
             q_norm: layer_weight(cx, l, "self_attn.q_norm", cfg.head_dim),
             k_norm: layer_weight(cx, l, "self_attn.k_norm", cfg.head_dim),
             attn_rms: rms_norm(cx, cfg, format!("model.layers.{l}.input_layernorm.weight")),

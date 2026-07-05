@@ -39,3 +39,23 @@ impl ChatTokenizer {
         self.inner.decode(&ids, true).map_err(|e| anyhow!("decode: {e}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_ids_in_range() {
+        let tok = ChatTokenizer::load("Qwen/Qwen3-4B").unwrap();
+        for (name, p) in [
+            ("template", "Tell me, in two sentences, why splitting a language model across friends' computers is a fun idea."),
+            ("poem", "Write a short poem about computers sharing work across the internet."),
+        ] {
+            let ids = tok.encode_chat(p).unwrap();
+            let mx = *ids.iter().max().unwrap();
+            eprintln!("{name}: {} tokens, max id {mx}", ids.len());
+            eprintln!("  ids = {ids:?}");
+            assert!(ids.iter().all(|&i| (0..151936).contains(&i)), "{name} out-of-range id");
+        }
+    }
+}

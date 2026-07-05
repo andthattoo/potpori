@@ -84,7 +84,7 @@ impl<R: QwenRuntime + 'static> Shard<R> {
         let input = if is_first {
             cx.named_tensor("input", 's').as_dtype(DType::Int)
         } else {
-            cx.named_tensor("input", ('s', cfg.hidden)).as_dtype(DType::F16)
+            cx.named_tensor("input", ('s', cfg.hidden)).as_dtype(super::model::main_dtype())
         };
         let pos_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
         let kv_cache = KVCache::new(&mut cx, &cfg, max_seq_len, n_layers);
@@ -111,7 +111,7 @@ impl<R: QwenRuntime + 'static> Shard<R> {
         cx.build_search_space::<R>(compile_options);
         runtime.load_safetensors(&cx, weights_path);
 
-        let cache_bytes = cfg.n_kv_heads * max_seq_len * cfg.head_dim * 2; // F16
+        let cache_bytes = cfg.n_kv_heads * max_seq_len * cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..n_layers {
             runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
             runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
@@ -176,7 +176,7 @@ impl<R: QwenRuntime + 'static> Shard<R> {
     }
 
     pub fn reset(&mut self) {
-        let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * 2;
+        let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..self.n_layers {
             self.runtime.set_zeros(self.kv_cache.k_caches[i].id, cache_bytes);
             self.runtime.set_zeros(self.kv_cache.v_caches[i].id, cache_bytes);
