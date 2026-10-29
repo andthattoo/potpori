@@ -23,14 +23,15 @@ use super::target::{argmax, QwenRuntime};
 use crate::engine::{TargetChain, TokenId};
 use crate::specpipe::PipelinedChain;
 use crate::transport::{
-    accept, dial, dial_endpoint, HiddenStateFrame, PeerMessage, PeerConnection, VerifyResult,
+    accept, dial, dial_endpoint, negotiate, receive_hello, relay_middle, HiddenStateFrame,
+    PeerConnection, PeerMessage, TlsIdentity, VerifyResult,
 };
 
 const EOS_TOKEN: TokenId = 151645; // <|im_end|>
 const STOP_TOKEN: TokenId = 151643; // <|endoftext|>
 
 /// The head's synchronous link to the downstream (remote) shards: one persistent QUIC bi-stream,
-/// driven by an owned current-thread runtime so each hop is a plain blocking call from the sync
+/// driven by an owned worker runtime so each hop is a plain blocking call from the sync
 /// spec-decode driver.
 pub struct QuicDownstream {
     rt: tokio::runtime::Runtime,
@@ -38,46 +39,83 @@ pub struct QuicDownstream {
     _endpoint: Endpoint,
     peer: PeerConnection,
     request_id: u64,
+    boundary: usize,
+    vocab: usize,
 }
 
 impl QuicDownstream {
     /// Dial the tail at `addr` and establish the bi-stream.
+    #[cfg(test)]
     pub fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        Self::connect_authenticated(addr, &TlsIdentity::for_tests())
+    }
+    pub fn connect_authenticated(addr: SocketAddr, tls: &TlsIdentity) -> io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()?;
         let (endpoint, peer) = rt.block_on(async move {
-            let ep = dial_endpoint()?;
+            let ep = dial_endpoint(tls)?;
             let peer = dial(&ep, addr).await?;
             io::Result::Ok((ep, peer))
         })?;
-        Ok(Self { rt, _endpoint: endpoint, peer, request_id: 0 })
+        Ok(Self {
+            rt,
+            _endpoint: endpoint,
+            peer,
+            request_id: 0,
+            boundary: 0,
+            vocab: 0,
+        })
     }
 
+    pub fn prepare<R: QwenRuntime + 'static>(&mut self, shard: &Shard<R>) -> io::Result<()> {
+        self.boundary = shard.range().1;
+        self.vocab = shard.vocab_size();
+        self.rt.block_on(negotiate(
+            &mut self.peer,
+            shard.hello(self.boundary),
+            shard.model_layers(),
+        ))
+    }
     /// Ship the post-head-shards residual stream (`s` positions from `start_pos`, dim `hidden_dim`)
     /// to the tail; block on the tail's per-position argmax.
-    pub fn forward(&mut self, start_pos: u32, s: usize, hidden_dim: usize, hidden: Vec<f32>) -> io::Result<Vec<TokenId>> {
+    pub fn forward(
+        &mut self,
+        start_pos: u32,
+        s: usize,
+        hidden_dim: usize,
+        hidden: Vec<f32>,
+    ) -> io::Result<Vec<TokenId>> {
         self.request_id += 1;
         let frame = HiddenStateFrame::from_f32(
             self.request_id,
             0,
             start_pos as u64,
             start_pos,
-            0,
+            self.boundary as u32,
             s as u32,
             hidden_dim as u32,
             &hidden,
         );
         let peer = &mut self.peer;
+        let vocab = self.vocab;
+        let (request_id, step) = (frame.request_id, frame.step);
         self.rt.block_on(async move {
             peer.send(&PeerMessage::Hidden(frame)).await?;
             match peer.recv().await? {
-                Some(PeerMessage::Result(r)) => Ok(r.argmax),
+                Some(PeerMessage::Result(r)) => {
+                    r.validate(request_id, step, s, vocab)?;
+                    Ok(r.argmax)
+                }
                 Some(other) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("tail returned {other:?}, expected Result"),
                 )),
-                None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tail closed mid-request")),
+                None => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tail closed mid-request",
+                )),
             }
         })
     }
@@ -102,10 +140,16 @@ pub struct RemoteChain<R: QwenRuntime> {
 }
 
 impl<R: QwenRuntime + 'static> RemoteChain<R> {
-    pub fn new(head: Vec<Shard<R>>, down: QuicDownstream) -> Self {
+    pub fn new(head: Vec<Shard<R>>, mut down: QuicDownstream) -> Self {
         assert!(!head.is_empty(), "the head needs at least one local shard");
         let hidden_dim = head[0].hidden_dim();
-        Self { head, down, hidden_dim }
+        down.prepare(head.last().unwrap())
+            .expect("negotiate shard chain");
+        Self {
+            head,
+            down,
+            hidden_dim,
+        }
     }
 
     /// Run `tokens` through the local head shards → residual stream, ship to the tail → the
@@ -125,12 +169,14 @@ impl<R: QwenRuntime + 'static> RemoteChain<R> {
         for shard in &mut self.head {
             shard.reset();
         }
-        // The tail resets its own KV on a fresh request_id boundary in this minimal version; for
-        // the test we drive a single generation per connection.
+        // Remote state is overwritten from position zero on the next prefill.
     }
 }
 
 impl<R: QwenRuntime + 'static> TargetChain for RemoteChain<R> {
+    fn capacity(&self) -> usize {
+        self.head.iter().map(Shard::capacity).min().unwrap()
+    }
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
         *self.run(0, prompt).last().expect("non-empty prompt")
     }
@@ -160,13 +206,27 @@ pub fn serve_tail<R: QwenRuntime + 'static>(
     endpoint: &Endpoint,
     rt: &tokio::runtime::Runtime,
 ) -> io::Result<()> {
-    assert!(shard.is_last(), "the tail must be the last shard (it owns the lm_head)");
+    assert!(
+        shard.is_last(),
+        "the tail must be the last shard (it owns the lm_head)"
+    );
     let vocab = shard.vocab_size();
     rt.block_on(async move {
         let mut peer = accept(endpoint).await?;
+        receive_hello(&mut peer, &shard.hello(shard.range().0)).await?;
+        peer.send(&PeerMessage::Ready {
+            final_layer: shard.range().1,
+        })
+        .await?;
         while let Some(msg) = peer.recv().await? {
             match msg {
                 PeerMessage::Hidden(frame) => {
+                    frame.validate(
+                        shard.hidden_dim(),
+                        shard.range().0,
+                        shard.capacity(),
+                        shard.chunk_size(),
+                    )?;
                     let s = frame.n_tokens as usize;
                     let hidden = frame.to_f32();
                     let logits = shard.forward_hidden(frame.start_pos, s, hidden); // sync GPU
@@ -181,7 +241,12 @@ pub fn serve_tail<R: QwenRuntime + 'static>(
                     .await?;
                 }
                 PeerMessage::Truncate(_) => {} // no-op: position-indexed KV
-                PeerMessage::Result(_) => break,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected session message",
+                    ))
+                }
             }
         }
         // Clean EOF from the head (its finish()): return; dropping `peer` closes back to the head.
@@ -193,67 +258,64 @@ pub fn serve_tail<R: QwenRuntime + 'static>(
 /// frame run the local shard, forward the new hidden downstream, and relay the result back
 /// upstream (return-through-chain). This is the 2-node hop composed recursively — a chain of any
 /// length is head → serve_middle → … → serve_middle → serve_tail.
+#[cfg(test)]
 pub fn serve_middle<R: QwenRuntime + 'static>(
     shard: &mut Shard<R>,
     upstream: &Endpoint,
     downstream_addr: SocketAddr,
     rt: &tokio::runtime::Runtime,
 ) -> io::Result<()> {
-    assert!(!shard.is_last(), "a middle shard must not be the last shard");
-    let hidden_dim = shard.hidden_dim();
-    rt.block_on(async move {
-        // Establish the downstream link first (it's already listening), then wait for the head.
-        let down_ep = dial_endpoint()?;
-        let mut down = dial(&down_ep, downstream_addr).await?;
+    serve_middle_authenticated(
+        shard,
+        upstream,
+        downstream_addr,
+        rt,
+        &TlsIdentity::for_tests(),
+    )
+}
+pub fn serve_middle_authenticated<R: QwenRuntime + 'static>(
+    shard: &mut Shard<R>,
+    upstream: &Endpoint,
+    downstream_addr: SocketAddr,
+    rt: &tokio::runtime::Runtime,
+    tls: &TlsIdentity,
+) -> io::Result<()> {
+    rt.block_on(async {
         let mut up = accept(upstream).await?;
-        let mut req = 0u64;
-        while let Some(msg) = up.recv().await? {
-            let frame = match msg {
-                PeerMessage::Hidden(f) => f,
-                PeerMessage::Truncate(_) => continue,
-                PeerMessage::Result(_) => break,
-            };
+        receive_hello(&mut up, &shard.hello(shard.range().0)).await?;
+        let down_ep = dial_endpoint(tls)?;
+        let mut down = dial(&down_ep, downstream_addr).await?;
+        negotiate(
+            &mut down,
+            shard.hello(shard.range().1),
+            shard.model_layers(),
+        )
+        .await?;
+        up.send(&PeerMessage::Ready {
+            final_layer: shard.model_layers(),
+        })
+        .await?;
+        relay_middle(up, down, |frame| {
+            frame.validate(
+                shard.hidden_dim(),
+                shard.range().0,
+                shard.capacity(),
+                shard.chunk_size(),
+            )?;
             let s = frame.n_tokens as usize;
-            let out = shard.forward_hidden(frame.start_pos, s, frame.to_f32()); // sync GPU
-            req += 1;
-            let down_frame = HiddenStateFrame::from_f32(
-                req,
+            let hidden = shard.forward_hidden(frame.start_pos, s, frame.to_f32());
+            Ok(HiddenStateFrame::from_f32(
+                frame.request_id,
                 frame.epoch,
                 frame.step,
                 frame.start_pos,
-                frame.layer_boundary + 1,
+                shard.range().1 as u32,
                 s as u32,
-                hidden_dim as u32,
-                &out,
-            );
-            down.send(&PeerMessage::Hidden(down_frame)).await?;
-            let result = match down.recv().await? {
-                Some(PeerMessage::Result(r)) => r,
-                Some(other) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("downstream returned {other:?}, expected Result"),
-                    ))
-                }
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "downstream closed mid-request",
-                    ))
-                }
-            };
-            // Relay upstream, preserving the upstream's request_id/step.
-            up.send(&PeerMessage::Result(VerifyResult {
-                request_id: frame.request_id,
-                step: frame.step,
-                argmax: result.argmax,
-            }))
-            .await?;
-        }
-        // Clean EOF from upstream → propagate the FIN downstream, then return (drop closes upstream).
-        down.finish();
-        down.wait_closed().await;
-        io::Result::Ok(())
+                shard.hidden_dim() as u32,
+                &hidden,
+            ))
+        })
+        .await
     })
 }
 
@@ -270,24 +332,41 @@ pub struct PipelinedQuicChain<R: QwenRuntime> {
     _endpoint: Endpoint,
     peer: PeerConnection,
     step: u64,
+    pending: std::collections::VecDeque<(u64, usize)>,
     /// 0 = send the whole prompt as one frame (generic kernel); >0 = prefill in frames of this
     /// many tokens + single-token remainder (chunk-specialized kernel, `load_chunked`).
     prefill_chunk: usize,
 }
 
 impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
+    #[cfg(test)]
     pub fn connect(head: Vec<Shard<R>>, tail_addr: SocketAddr) -> io::Result<Self> {
+        Self::connect_authenticated(head, tail_addr, &TlsIdentity::for_tests())
+    }
+    pub fn connect_authenticated(
+        head: Vec<Shard<R>>,
+        tail_addr: SocketAddr,
+        tls: &TlsIdentity,
+    ) -> io::Result<Self> {
         assert!(!head.is_empty(), "the head needs at least one local shard");
         let hidden_dim = head[0].hidden_dim();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let hello = head.last().unwrap().hello(head.last().unwrap().range().1);
+        let final_layer = head.last().unwrap().model_layers();
         let (endpoint, peer) = rt.block_on(async move {
-            let ep = dial_endpoint()?;
+            let ep = dial_endpoint(tls)?;
             // Peers come up at different times (their kernel search takes minutes) — retry
             // with backoff for up to ~10 minutes instead of failing on the first dial.
             let mut last_err = None;
             for attempt in 0..120u32 {
                 match dial(&ep, tail_addr).await {
-                    Ok(peer) => return io::Result::Ok((ep, peer)),
+                    Ok(mut peer) => {
+                        negotiate(&mut peer, hello.clone(), final_layer).await?;
+                        return io::Result::Ok((ep, peer));
+                    }
                     Err(e) => {
                         if attempt % 12 == 0 {
                             tracing::info!("waiting for {tail_addr} (still loading?): {e}");
@@ -299,7 +378,16 @@ impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
             }
             Err(last_err.unwrap())
         })?;
-        Ok(Self { head, hidden_dim, rt, _endpoint: endpoint, peer, step: 0, prefill_chunk: 0 })
+        Ok(Self {
+            head,
+            hidden_dim,
+            rt,
+            _endpoint: endpoint,
+            peer,
+            step: 0,
+            pending: Default::default(),
+            prefill_chunk: 0,
+        })
     }
 
     /// Restrict prefill to frames of `chunk` tokens (+ single-token remainder). REQUIRED when
@@ -320,12 +408,13 @@ impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
 
     fn send_hidden(&mut self, start_pos: u32, s: usize, hidden: Vec<f32>) {
         self.step += 1;
+        self.pending.push_back((self.step, s));
         let frame = HiddenStateFrame::from_f32(
             self.step,
             0,
             self.step,
             start_pos,
-            0,
+            self.head.last().unwrap().range().1 as u32,
             s as u32,
             self.hidden_dim as u32,
             &hidden,
@@ -337,16 +426,24 @@ impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
     }
 
     fn recv_result(&mut self) -> Vec<TokenId> {
+        let (expected, n) = self.pending.pop_front().expect("result without request");
+        let vocab = self.head[0].vocab_size();
         let peer = &mut self.peer;
         self.rt
             .block_on(async move {
                 match peer.recv().await? {
-                    Some(PeerMessage::Result(r)) => Ok(r.argmax),
+                    Some(PeerMessage::Result(r)) => {
+                        r.validate(expected, expected, n, vocab)?;
+                        Ok(r.argmax)
+                    }
                     Some(other) => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("tail returned {other:?}, expected Result"),
                     )),
-                    None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tail closed mid-request")),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "tail closed mid-request",
+                    )),
                 }
             })
             .expect("pipelined poll recv")
@@ -362,13 +459,24 @@ impl<R: QwenRuntime + 'static> PipelinedQuicChain<R> {
 }
 
 impl<R: QwenRuntime + 'static> PipelinedChain for PipelinedQuicChain<R> {
+    fn capacity(&self) -> usize {
+        self.head.iter().map(Shard::capacity).min().unwrap()
+    }
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
-        let chunk = if self.prefill_chunk == 0 { prompt.len() } else { self.prefill_chunk };
+        let chunk = if self.prefill_chunk == 0 {
+            prompt.len()
+        } else {
+            self.prefill_chunk
+        };
         let mut pos = 0usize;
         let mut last = 0;
         while pos < prompt.len() {
             // Full chunks first, then a single-token tail — every frame is s ∈ {chunk, 1}.
-            let take = if prompt.len() - pos >= chunk { chunk } else { 1 };
+            let take = if prompt.len() - pos >= chunk {
+                chunk
+            } else {
+                1
+            };
             let hidden = self.run_head(pos as u32, &prompt[pos..pos + take]);
             self.send_hidden(pos as u32, take, hidden);
             last = *self.recv_result().last().expect("non-empty piece");
@@ -401,7 +509,6 @@ impl<R: QwenRuntime + 'static> PipelinedChain for PipelinedQuicChain<R> {
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
 mod tests {
     use super::*;
-    use luminal::prelude::Runtime; // MetalRuntime::initialize is a Runtime-trait method
     use crate::qwen::hf::prepare_hf_model;
     use crate::qwen::model::QwenConfig;
     use crate::qwen::target::QwenTarget;
@@ -427,7 +534,11 @@ mod tests {
     fn qwen_pipeline_over_quic() {
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let k = cfg.layers / 2;
 
         // Tail thread: bind the endpoint inside its own runtime, report the addr early (before the
@@ -442,11 +553,11 @@ mod tests {
                 .unwrap();
             let endpoint = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             addr_tx.send(endpoint.local_addr().unwrap()).unwrap();
             let mut shard1 = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (k, cfg.layers),
                 false,
@@ -459,12 +570,17 @@ mod tests {
         });
 
         // Single-process baseline.
-        let mut full =
-            QwenTarget::load(luminal_metal::MetalRuntime::initialize(()), cfg, &wp, 512, 200);
+        let mut full = QwenTarget::load(
+            crate::qwen::runtime::MetalRuntime::initialize(()),
+            cfg,
+            &wp,
+            512,
+            200,
+        );
 
         // Head: shard 0, dial the tail, build the distributed chain.
         let shard0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -495,7 +611,11 @@ mod tests {
                 println!("LOSSLESS PIPELINE: head + tail over QUIC == single-process forward")
             }
             Some(i) => println!("diverge @{i}: full={} pipe={}", base[i], distributed[i]),
-            None => println!("length differ: full={} pipe={}", base.len(), distributed.len()),
+            None => println!(
+                "length differ: full={} pipe={}",
+                base.len(),
+                distributed.len()
+            ),
         }
         assert_eq!(base, distributed, "the 2-process pipeline must be lossless");
     }
@@ -509,7 +629,11 @@ mod tests {
         use std::sync::mpsc;
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let l = cfg.layers;
         let a = l / 3; // head [0,a), middle [a,b), tail [b,l)
         let b = 2 * l / 3;
@@ -529,11 +653,11 @@ mod tests {
             let rt = mk_rt();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             tail_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (b, l),
                 false,
@@ -553,11 +677,11 @@ mod tests {
             let rt = mk_rt();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             mid_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (a, b),
                 false,
@@ -571,10 +695,15 @@ mod tests {
         let mid_addr = mid_rx.recv().expect("middle addr");
 
         // Baseline + head.
-        let mut full =
-            QwenTarget::load(luminal_metal::MetalRuntime::initialize(()), cfg, &wp, 512, 200);
+        let mut full = QwenTarget::load(
+            crate::qwen::runtime::MetalRuntime::initialize(()),
+            cfg,
+            &wp,
+            512,
+            200,
+        );
         let shard0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, a),
             true,
@@ -601,7 +730,9 @@ mod tests {
         println!("pipeline (3 nodes/QUIC) = {dist:?}");
         match (0..base.len().min(dist.len())).find(|&i| base[i] != dist[i]) {
             None if base.len() == dist.len() => {
-                println!("LOSSLESS 3-NODE PIPELINE: head + middle + tail over QUIC == single-process")
+                println!(
+                    "LOSSLESS 3-NODE PIPELINE: head + middle + tail over QUIC == single-process"
+                )
             }
             Some(i) => println!("diverge @{i}: full={} pipe={}", base[i], dist[i]),
             None => println!("length differ: full={} pipe={}", base.len(), dist.len()),
@@ -619,8 +750,9 @@ mod tests {
                 for i in (0..n - 2).rev() {
                     if context[i] == a && context[i + 1] == b {
                         let start = i + 2;
-                        let mut d: Vec<TokenId> =
-                            (0..gamma).filter_map(|k| context.get(start + k).copied()).collect();
+                        let mut d: Vec<TokenId> = (0..gamma)
+                            .filter_map(|k| context.get(start + k).copied())
+                            .collect();
                         if !d.is_empty() {
                             while d.len() < gamma {
                                 d.push(*d.last().unwrap());
@@ -644,7 +776,11 @@ mod tests {
         use crate::specpipe::run_spec_decode_pipelined;
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let k = cfg.layers / 2;
 
         let (tail_tx, tail_rx) = std::sync::mpsc::channel();
@@ -657,11 +793,11 @@ mod tests {
                 .unwrap();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             tail_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (k, cfg.layers),
                 false,
@@ -674,10 +810,15 @@ mod tests {
         });
         let tail_addr = tail_rx.recv().expect("tail addr");
 
-        let mut full =
-            QwenTarget::load(luminal_metal::MetalRuntime::initialize(()), cfg, &wp, 512, 200);
+        let mut full = QwenTarget::load(
+            crate::qwen::runtime::MetalRuntime::initialize(()),
+            cfg,
+            &wp,
+            512,
+            200,
+        );
         let shard0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -689,7 +830,10 @@ mod tests {
         let mut chain = PipelinedQuicChain::connect(vec![shard0], tail_addr).expect("connect tail");
 
         let prompt: Vec<TokenId> = vec![40, 1079, 264, 4108, 4108];
-        let spec_cfg = SpecConfig { gamma: 4, max_new: 24 };
+        let spec_cfg = SpecConfig {
+            gamma: 4,
+            max_new: 24,
+        };
 
         full.reset();
         let base = greedy(&mut full, &prompt, 24);
@@ -704,12 +848,17 @@ mod tests {
         println!("toks/traversal = {:.2}", stats.toks_per_traversal());
         match (0..base.len().min(out.len())).find(|&i| base[i] != out[i]) {
             None if base.len() == out.len() => {
-                println!("LOSSLESS PIPELINED over QUIC == greedy (depth-N driver + no-op truncate hold)")
+                println!(
+                    "LOSSLESS PIPELINED over QUIC == greedy (depth-N driver + no-op truncate hold)"
+                )
             }
             Some(i) => println!("diverge @{i}: full={} pipe={}", base[i], out[i]),
             None => println!("length differ: full={} pipe={}", base.len(), out.len()),
         }
-        assert_eq!(base, out, "the pipelined QUIC chain must be lossless vs greedy");
+        assert_eq!(
+            base, out,
+            "the pipelined QUIC chain must be lossless vs greedy"
+        );
     }
 
     /// Perfect draft: returns the target's own greedy continuation, so the pipeline never flushes.
@@ -720,7 +869,9 @@ mod tests {
     impl crate::engine::DraftEngine for PerfectDraft {
         fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
             let l = context.len() - self.prompt_len;
-            (0..gamma).map(|j| *self.truth.get(l + j).unwrap_or(&0)).collect()
+            (0..gamma)
+                .map(|j| *self.truth.get(l + j).unwrap_or(&0))
+                .collect()
         }
     }
 
@@ -738,7 +889,11 @@ mod tests {
         use std::time::Instant;
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let k = cfg.layers / 2;
 
         let (tail_tx, tail_rx) = std::sync::mpsc::channel();
@@ -751,11 +906,11 @@ mod tests {
                 .unwrap();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             tail_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (k, cfg.layers),
                 false,
@@ -769,15 +924,20 @@ mod tests {
         let tail_addr = tail_rx.recv().expect("tail addr");
 
         // Truth = the target's greedy continuation (drives the perfect draft).
-        let mut full =
-            QwenTarget::load(luminal_metal::MetalRuntime::initialize(()), cfg, &wp, 768, 200);
+        let mut full = QwenTarget::load(
+            crate::qwen::runtime::MetalRuntime::initialize(()),
+            cfg,
+            &wp,
+            768,
+            200,
+        );
         let prompt: Vec<TokenId> = vec![40, 1079, 264, 4108, 4108];
         let n = 500;
         full.reset();
         let truth = greedy(&mut full, &prompt, n);
 
         let shard0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -787,8 +947,14 @@ mod tests {
             200,
         );
         let mut chain = PipelinedQuicChain::connect(vec![shard0], tail_addr).expect("connect tail");
-        let spec_cfg = SpecConfig { gamma: 6, max_new: truth.len() };
-        let mut draft = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let spec_cfg = SpecConfig {
+            gamma: 6,
+            max_new: truth.len(),
+        };
+        let mut draft = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
 
         // Warm-up (first run pays one-time per-shape costs).
         let _ = run_spec_decode_pipelined(&mut draft, &mut chain, &prompt, &spec_cfg, 1);
@@ -806,9 +972,24 @@ mod tests {
 
         let tps1 = out1.len() as f64 / dt1.as_secs_f64();
         let tps4 = out4.len() as f64 / dt4.as_secs_f64();
-        println!("\ndepth-1 (no pipelining): {} tok in {:.3}s = {:.1} tok/s ({} traversals)", out1.len(), dt1.as_secs_f64(), tps1, st1.traversals);
-        println!("depth-4 (pipelined):     {} tok in {:.3}s = {:.1} tok/s ({} traversals)", out4.len(), dt4.as_secs_f64(), tps4, st4.traversals);
-        println!("PIPELINING SPEEDUP: {:.2}x (loopback ⇒ compute-overlap only; WAN adds RTT-hiding)", tps4 / tps1);
+        println!(
+            "\ndepth-1 (no pipelining): {} tok in {:.3}s = {:.1} tok/s ({} traversals)",
+            out1.len(),
+            dt1.as_secs_f64(),
+            tps1,
+            st1.traversals
+        );
+        println!(
+            "depth-4 (pipelined):     {} tok in {:.3}s = {:.1} tok/s ({} traversals)",
+            out4.len(),
+            dt4.as_secs_f64(),
+            tps4,
+            st4.traversals
+        );
+        println!(
+            "PIPELINING SPEEDUP: {:.2}x (loopback ⇒ compute-overlap only; WAN adds RTT-hiding)",
+            tps4 / tps1
+        );
         assert_eq!(out1, truth, "depth-1 must be lossless");
         assert_eq!(out4, truth, "depth-4 must be lossless");
     }
@@ -822,7 +1003,11 @@ mod tests {
         use std::time::Instant;
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let k = cfg.layers / 2;
 
         let (tail_tx, tail_rx) = std::sync::mpsc::channel();
@@ -835,11 +1020,11 @@ mod tests {
                 .unwrap();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             tail_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (k, cfg.layers),
                 false,
@@ -853,7 +1038,7 @@ mod tests {
         let tail_addr = tail_rx.recv().expect("tail addr");
 
         let mut shard0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -867,6 +1052,7 @@ mod tests {
 
         // prefill
         let h = shard0.forward_tokens(0, &[40]);
+        down.prepare(&shard0).unwrap();
         let r = down.forward(0, 1, hidden_dim, h).expect("prefill hop");
         let mut cur = *r.last().unwrap();
         let mut pos = 1u32;
@@ -884,7 +1070,10 @@ mod tests {
             cur = r[0];
             pos += 1;
             if step % 20 == 0 {
-                println!("  ctx≈{:>3}: head {:>6.1} ms | roundtrip {:>7.1} ms", pos, head_ms, rt_ms);
+                println!(
+                    "  ctx≈{:>3}: head {:>6.1} ms | roundtrip {:>7.1} ms",
+                    pos, head_ms, rt_ms
+                );
             }
         }
         down.shutdown();
@@ -904,7 +1093,11 @@ mod tests {
         use std::time::Instant;
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let wp = dir.join("model_combined_bf16_v1.safetensors").to_str().unwrap().to_string();
+        let wp = dir
+            .join("model_combined_bf16_v1.safetensors")
+            .to_str()
+            .unwrap()
+            .to_string();
         let k = cfg.layers / 2;
         let chunk = 8usize; // γ+1 (γ=7) — the specialized verify chunk size
 
@@ -918,11 +1111,11 @@ mod tests {
                 .unwrap();
             let ep = {
                 let _g = rt.enter();
-                listen_endpoint("127.0.0.1:0".parse().unwrap()).unwrap()
+                listen_endpoint("127.0.0.1:0".parse().unwrap(), &TlsIdentity::for_tests()).unwrap()
             };
             tail_tx.send(ep.local_addr().unwrap()).unwrap();
             let mut shard = Shard::load_chunked(
-                luminal_metal::MetalRuntime::initialize(()),
+                crate::qwen::runtime::MetalRuntime::initialize(()),
                 cfg,
                 (k, cfg.layers),
                 false,
@@ -938,7 +1131,7 @@ mod tests {
 
         let prompt: Vec<TokenId> = vec![40, 1079, 264, 4108, 4108, 11, 323, 358]; // 8 → prefill s=8
         let shard0 = Shard::load_chunked(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -949,7 +1142,10 @@ mod tests {
             chunk,
         );
         let mut chain = PipelinedQuicChain::connect(vec![shard0], tail_addr).expect("connect tail");
-        let spec_cfg = SpecConfig { gamma: chunk - 1, max_new: 200 };
+        let spec_cfg = SpecConfig {
+            gamma: chunk - 1,
+            max_new: 200,
+        };
 
         // Truth = the chain's OWN greedy continuation. Spec-decode is lossless for ANY draft, so
         // this equals the s=8-verify greedy — the perfect draft below then matches the chain
@@ -957,7 +1153,10 @@ mod tests {
         // batching gives different argmaxes at near-ties (the M1 finding).
         let mut ngram = NgramDraft;
         let (truth, _) = run_spec_decode_pipelined(&mut ngram, &mut chain, &prompt, &spec_cfg, 1);
-        let mut draft = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let mut draft = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
 
         let _ = run_spec_decode_pipelined(&mut draft, &mut chain, &prompt, &spec_cfg, 1); // warm-up
         let t0 = Instant::now();
@@ -974,10 +1173,29 @@ mod tests {
         let tps1 = out1.len() as f64 / dt1.as_secs_f64();
         let tps4 = out4.len() as f64 / dt4.as_secs_f64();
         println!("\n[SPECIALIZED s=8 kernel + matching perfect draft]");
-        println!("depth-1: {} tok in {:.3}s = {:.1} tok/s ({} traversals, {:.0} ms/traversal)", out1.len(), dt1.as_secs_f64(), tps1, st1.traversals, ms_per_trav);
-        println!("depth-4: {} tok in {:.3}s = {:.1} tok/s ({} traversals)", out4.len(), dt4.as_secs_f64(), tps4, st4.traversals);
+        println!(
+            "depth-1: {} tok in {:.3}s = {:.1} tok/s ({} traversals, {:.0} ms/traversal)",
+            out1.len(),
+            dt1.as_secs_f64(),
+            tps1,
+            st1.traversals,
+            ms_per_trav
+        );
+        println!(
+            "depth-4: {} tok in {:.3}s = {:.1} tok/s ({} traversals)",
+            out4.len(),
+            dt4.as_secs_f64(),
+            tps4,
+            st4.traversals
+        );
         println!("=> ~{ms_per_trav:.0} ms/traversal vs generic ~2950 ms (≈{:.0}× kernel) | pipelining {:.2}× | generic spec-decode was ~2 tok/s", 2950.0 / ms_per_trav, tps4 / tps1);
-        assert_eq!(out1, truth, "perfect-draft depth-1 must reproduce the chain's greedy");
-        assert_eq!(out4, truth, "perfect-draft depth-4 must reproduce the chain's greedy");
+        assert_eq!(
+            out1, truth,
+            "perfect-draft depth-1 must reproduce the chain's greedy"
+        );
+        assert_eq!(
+            out4, truth,
+            "perfect-draft depth-4 must reproduce the chain's greedy"
+        );
     }
 }

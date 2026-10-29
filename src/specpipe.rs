@@ -1,10 +1,9 @@
 //! Async depth-N **pipelined** speculative-decode driver — shard's `coordinate_pipe` in Rust.
 //!
 //! The synchronous driver ([`crate::specdecode::run_spec_decode`]) pays one full chain
-//! traversal per committed chunk (the ~3 tok/s regime over WAN). This driver keeps `depth`
-//! verify chunks **in flight at once** over a direct-return ring, speculatively chaining
-//! each chunk on the previous chunk's *draft* output — so throughput approaches the ring's
-//! per-stage throughput, not its full latency (shard measured 2.94 → 16.6 tok/s). On a
+//! traversal per committed chunk. This driver keeps `depth` verify chunks in flight,
+//! speculatively chaining each chunk on the previous chunk's draft output. Replies are
+//! relayed upstream independently of work flowing downstream. On a
 //! divergence, every still-in-flight chunk is stale: they're drained-and-discarded and
 //! drafting re-seeds from the corrected prefix. Greedy id-equality keeps the committed
 //! output **bit-identical to the synchronous driver** (and to plain greedy decode).
@@ -17,8 +16,11 @@ use crate::engine::{DraftEngine, TokenId};
 use crate::specdecode::{SpecConfig, SpecStats};
 
 /// A target chain that supports depth-N pipelining: many verify chunks in flight at once,
-/// completing in FIFO (submission) order — the "direct-return ring" (tail → owner, 1 hop).
+/// completing in FIFO (submission) order.
 pub trait PipelinedChain {
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
     /// Prefill `prompt`; return the first pending token (the chain's argmax after the prompt).
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId;
     /// Submit a verify chunk `[cur] + drafts` whose first token sits at absolute KV position
@@ -41,16 +43,27 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
     cfg: &SpecConfig,
     depth: usize,
 ) -> (Vec<TokenId>, SpecStats) {
-    let gamma = cfg.gamma.max(1);
+    assert!(cfg.gamma > 0, "gamma must be positive");
+    if cfg.max_new == 0 {
+        return (Vec::new(), SpecStats::default());
+    }
+    let capacity = chain.capacity().min(draft.capacity());
+    assert!(
+        !prompt.is_empty() && prompt.len() < capacity,
+        "prompt must leave room in the KV cache"
+    );
+    let max_new = cfg.max_new.min(capacity - prompt.len());
+    let gamma = cfg.gamma;
     let depth = depth.max(1);
     let prompt_len = prompt.len() as u32;
 
     let cur0 = chain.prefill(prompt);
     let mut out: Vec<TokenId> = Vec::new();
-    let mut done = chain.is_eos(cur0) || cfg.max_new == 0;
+    let mut done = chain.is_eos(cur0);
     if !done {
         out.push(cur0); // out is seeded with the first pending token (shard: `out = [cur]`)
     }
+    done |= out.len() >= max_new;
 
     // `dprefix` is the speculative draft chain; its last element is the next chunk's `cur`.
     let mut dprefix: Vec<TokenId> = prompt.to_vec();
@@ -65,17 +78,38 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
 
     loop {
         // FILL: keep `depth` chunks marching, chaining speculatively on `dprefix`.
-        while inflight.len() < depth && !done {
+        while inflight.len() < depth && !done && discard == 0 {
             let cur = *dprefix.last().unwrap();
             if chain.is_eos(cur) {
-                done = true;
+                // Only a verified EOS terminates output. Pause speculative filling.
                 break;
             }
-            let ds = draft.draft(&dprefix, gamma);
+            let remaining = capacity.saturating_sub(send_pos as usize);
+            if remaining == 0 {
+                break;
+            }
+            // Point buckets support full verify chunks or one token. Near capacity,
+            // drain speculative work and advance using target-only single-token steps.
+            let single = remaining <= gamma;
+            if single && !inflight.is_empty() {
+                break;
+            }
+            let ds = if single {
+                Vec::new()
+            } else {
+                draft.draft(&dprefix, gamma)
+            };
+            assert!(
+                single || ds.len() == gamma,
+                "draft returned the wrong token count"
+            );
             chain.submit(send_pos, cur, &ds);
             dprefix.extend_from_slice(&ds);
             inflight.push_back(ds);
             send_pos += gamma as u32;
+            if single {
+                break;
+            }
         }
         if inflight.is_empty() {
             break;
@@ -84,6 +118,7 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
         // READ one completed chunk (FIFO).
         let r = chain.poll();
         let ds = inflight.pop_front().unwrap();
+        assert_eq!(r.len(), ds.len() + 1, "invalid verification result length");
         traversals += 1;
         if std::env::var("POTPORI_DEBUG").is_ok() && traversals <= 14 {
             eprintln!(
@@ -102,7 +137,7 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
         while n < ds.len() && n < r.len() && ds[n] == r[n] {
             n += 1;
         }
-        let diverged = n != ds.len();
+        let diverged = ds.is_empty() || n != ds.len();
         let committed: Vec<TokenId> = if diverged {
             let mut c = ds[..n].to_vec();
             c.push(r[n]); // accepted prefix + correction
@@ -117,7 +152,7 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
                 break;
             }
             out.push(t);
-            if out.len() >= cfg.max_new {
+            if out.len() >= max_new {
                 done = true;
                 break;
             }
@@ -141,13 +176,128 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
     }
 
     let committed = out.len();
-    (out, SpecStats { committed, traversals })
+    (
+        out,
+        SpecStats {
+            committed,
+            traversals,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::TargetChain;
     use super::*;
+    use crate::engine::TargetChain;
+
+    #[test]
+    fn unverified_eos_does_not_stop_output() {
+        struct EarlyEos;
+        impl DraftEngine for EarlyEos {
+            fn draft(&mut self, _: &[TokenId], gamma: usize) -> Vec<TokenId> {
+                let mut d = vec![-100; gamma];
+                d[gamma - 1] = 9999;
+                d
+            }
+        }
+        let truth: Vec<_> = (1..=30).collect();
+        for depth in [1, 2, 4, 8] {
+            let mut chain = SyntheticPipe::new(truth.clone(), 9999);
+            let (out, _) = run_spec_decode_pipelined(
+                &mut EarlyEos,
+                &mut chain,
+                &[100],
+                &SpecConfig {
+                    gamma: 2,
+                    max_new: 10,
+                },
+                depth,
+            );
+            assert_eq!(out, truth[..10], "depth={depth}");
+        }
+    }
+    #[test]
+    fn respects_zero_and_one_token_caps_and_verified_eos() {
+        let truth = vec![1, 2, 3, 9999];
+        for max_new in [0, 1, 2, 10] {
+            for depth in [1, 4] {
+                let mut chain = SyntheticPipe::new(truth.clone(), 9999);
+                let mut draft = PerfectDraft {
+                    truth: truth.clone(),
+                    prompt_len: 1,
+                };
+                let (out, _) = run_spec_decode_pipelined(
+                    &mut draft,
+                    &mut chain,
+                    &[100],
+                    &SpecConfig { gamma: 2, max_new },
+                    depth,
+                );
+                assert_eq!(out, truth[..max_new.min(3)]);
+                assert!(chain.q.is_empty(), "all in-flight requests must drain");
+            }
+        }
+    }
+    #[test]
+    fn lookahead_stays_within_capacity() {
+        struct Bounded {
+            inner: SyntheticPipe,
+            limit: usize,
+            single: usize,
+        }
+        impl PipelinedChain for Bounded {
+            fn capacity(&self) -> usize {
+                self.limit
+            }
+            fn prefill(&mut self, p: &[TokenId]) -> TokenId {
+                self.inner.prefill(p)
+            }
+            fn submit(&mut self, pos: u32, cur: TokenId, ds: &[TokenId]) {
+                assert!(pos as usize + ds.len() < self.limit);
+                assert!(
+                    ds.is_empty() || ds.len() == 7,
+                    "must use compiled point buckets"
+                );
+                if ds.is_empty() {
+                    self.single += 1;
+                }
+                self.inner.submit(pos, cur, ds)
+            }
+            fn poll(&mut self) -> Vec<TokenId> {
+                self.inner.poll()
+            }
+            fn truncate(&mut self, p: u32) {
+                self.inner.truncate(p)
+            }
+            fn is_eos(&self, t: TokenId) -> bool {
+                self.inner.is_eos(t)
+            }
+        }
+        let truth: Vec<_> = (1..100).collect();
+        for depth in [1, 4, 8] {
+            let mut c = Bounded {
+                inner: SyntheticPipe::new(truth.clone(), 9999),
+                limit: 768,
+                single: 0,
+            };
+            let mut d = PerfectDraft {
+                truth: truth.clone(),
+                prompt_len: 740,
+            };
+            let (out, _) = run_spec_decode_pipelined(
+                &mut d,
+                &mut c,
+                &vec![100; 740],
+                &SpecConfig {
+                    gamma: 7,
+                    max_new: 28,
+                },
+                depth,
+            );
+            assert_eq!(out, truth[..28]);
+            assert!(c.single > 0);
+        }
+    }
 
     /// Pipelined synthetic chain: its greedy continuation of any prompt is a fixed `truth`.
     /// FIFO queue of submitted chunks' `(start_pos, n_drafts)`; `poll` computes argmaxes
@@ -161,7 +311,12 @@ mod tests {
     }
     impl SyntheticPipe {
         fn new(truth: Vec<TokenId>, eos: TokenId) -> Self {
-            Self { truth, prompt_len: 0, eos, q: VecDeque::new() }
+            Self {
+                truth,
+                prompt_len: 0,
+                eos,
+                q: VecDeque::new(),
+            }
         }
     }
     impl PipelinedChain for SyntheticPipe {
@@ -175,7 +330,9 @@ mod tests {
         fn poll(&mut self) -> Vec<TokenId> {
             let (start_pos, len) = self.q.pop_front().expect("poll with no in-flight chunk");
             let l = (start_pos - self.prompt_len) as usize; // gen index of `cur`
-            (0..=len).map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos)).collect()
+            (0..=len)
+                .map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos))
+                .collect()
         }
         fn truncate(&mut self, _keep_to_pos: u32) {}
         fn is_eos(&self, token: TokenId) -> bool {
@@ -190,7 +347,9 @@ mod tests {
     impl DraftEngine for PerfectDraft {
         fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
             let l = context.len() - self.prompt_len;
-            (0..gamma).map(|j| *self.truth.get(l + j).unwrap_or(&-1)).collect()
+            (0..gamma)
+                .map(|j| *self.truth.get(l + j).unwrap_or(&-1))
+                .collect()
         }
     }
     struct GarbageDraft;
@@ -205,13 +364,19 @@ mod tests {
         let truth: Vec<TokenId> = (1..=80).collect();
         let eos = 9999;
         let prompt = vec![5, 6, 7];
-        let cfg = SpecConfig { gamma: 4, max_new: 50 };
+        let cfg = SpecConfig {
+            gamma: 4,
+            max_new: 50,
+        };
         let expected: Vec<TokenId> = truth[..cfg.max_new].to_vec();
 
         for depth in [1usize, 2, 4, 8] {
             // Perfect draft: pipeline stays full, no flushes.
             let mut c = SyntheticPipe::new(truth.clone(), eos);
-            let mut d = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+            let mut d = PerfectDraft {
+                truth: truth.clone(),
+                prompt_len: prompt.len(),
+            };
             let (out_p, _) = run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth);
             assert_eq!(out_p, expected, "perfect draft, depth={depth}");
 
@@ -229,7 +394,10 @@ mod tests {
         let truth: Vec<TokenId> = (100..200).collect();
         let eos = -7;
         let prompt = vec![1, 2];
-        let cfg = SpecConfig { gamma: 6, max_new: 60 };
+        let cfg = SpecConfig {
+            gamma: 6,
+            max_new: 60,
+        };
 
         // synchronous reference (reuse the sync driver's synthetic target via a thin adapter)
         struct SyncTarget {
@@ -242,9 +410,16 @@ mod tests {
                 self.prompt_len = prompt.len() as u32;
                 *self.truth.first().unwrap_or(&self.eos)
             }
-            fn verify(&mut self, start_pos: u32, _cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
+            fn verify(
+                &mut self,
+                start_pos: u32,
+                _cur: TokenId,
+                drafts: &[TokenId],
+            ) -> Vec<TokenId> {
                 let l = (start_pos - self.prompt_len) as usize;
-                (0..=drafts.len()).map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos)).collect()
+                (0..=drafts.len())
+                    .map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos))
+                    .collect()
             }
             fn truncate(&mut self, _: u32) {}
             fn is_eos(&self, t: TokenId) -> bool {
@@ -252,14 +427,27 @@ mod tests {
             }
         }
 
-        let mut st = SyncTarget { truth: truth.clone(), prompt_len: 0, eos };
-        let mut sd = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let mut st = SyncTarget {
+            truth: truth.clone(),
+            prompt_len: 0,
+            eos,
+        };
+        let mut sd = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
         let (sync_out, _) = crate::specdecode::run_spec_decode(&mut sd, &mut st, &prompt, &cfg);
 
         let mut pc = SyntheticPipe::new(truth.clone(), eos);
-        let mut pd = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let mut pd = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
         let (pipe_out, _) = run_spec_decode_pipelined(&mut pd, &mut pc, &prompt, &cfg, 4);
 
-        assert_eq!(sync_out, pipe_out, "pipelined output must equal synchronous output");
+        assert_eq!(
+            sync_out, pipe_out,
+            "pipelined output must equal synchronous output"
+        );
     }
 }

@@ -2,6 +2,7 @@
 name = "potpori"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91"
 license = "Apache-2.0"
 description = "Sharded LLM inference with your friends over WAN — pipeline-parallel + lossless speculative decoding on Luminal"
 repository = "https://github.com/andthattoo/potpori"
@@ -15,6 +16,7 @@ default = []
 # Inference-engine deps (Luminal model graph + safetensors weight loading + tokenizer);
 # enabled by a backend feature.
 engine = [
+    "dep:luminal",
     "dep:luminal_nn",
     "dep:hf-hub",
     "dep:safetensors",
@@ -23,14 +25,15 @@ engine = [
     "dep:memmap2",
     "dep:tokenizers",
     "dep:serde_json",
+    "dep:tempfile",
 ]
 # Backend selectors: pull in the Luminal backend crate (+ the engine deps) for the accelerator.
-cuda = ["dep:luminal_cuda_lite", "engine"]
-metal = ["dep:luminal_metal", "engine"]
+cuda = ["dep:luminal_cuda_lite", "luminal_cuda_lite/device", "dep:cudarc", "engine"]
+metal = ["dep:luminal_metal", "dep:metal", "dep:objc", "engine"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 toml = "0.8"
@@ -40,13 +43,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
+rustls-pemfile = "2"
 
-# Compute substrate: Luminal, pinned to the validated upstream rev (crates.io ships the older
-# pre-egglog-rewrite release). The core graph lib is always built; backend crates are optional.
-luminal = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd" }
-luminal_metal = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
-luminal_cuda_lite = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
-luminal_nn = { git = "https://github.com/jafioti/luminal", rev = "497b1aad9b7af7db7efeb93b46845d9f8f8919cd", optional = true }
+# Compute substrate: upstream main as of 2026-10-29. Keep every Luminal crate on one revision.
+# GPU-free coordination tests do not build the model/compiler dependency tree.
+luminal = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
+luminal_metal = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
+luminal_cuda_lite = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
+luminal_nn = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
+cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
+tempfile = { version = "3", optional = true }
+
 
 # Model weight loading + tokenizer, behind the `engine` feature.
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"], optional = true }
@@ -56,3 +63,7 @@ bytemuck = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }
 tokenizers = { version = "0.21", optional = true }
 serde_json = { version = "1", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.31", optional = true }
+objc = { version = "0.2", optional = true }

@@ -1,0 +1,8 @@
+The files src/qwen/runtime/cuda.rs, cuda_memory.rs, metal.rs, and metal_memory.rs
+adapt the corresponding llm_chat_cuda / llm_chat_metal examples from Luminal:
+https://github.com/luminal-ai/luminal/tree/1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1/examples
+
+Luminal is licensed under MIT OR Apache-2.0. These adaptations are distributed
+under the Apache-2.0 option. The applicable Apache-2.0 license is included in
+LICENSE. The adaptation replaces the application graph contract with Potpori's
+shard contract; upstream buffer lifetime and binding semantics are preserved.

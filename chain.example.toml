@@ -6,15 +6,16 @@
 #
 # Each remote friend runs `potpori serve` with a matching layer range, e.g. for this file:
 #   friend A (middle): potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-#                        --layers 12:24 --role middle --downstream 100.64.0.3:4010 --chunk 8
+#                        --layers 12:24 --role middle --downstream 100.64.0.3:4010 --chunk 8 --max-seq 768
 #   friend B (tail):   potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-#                        --layers 24:36 --role tail --chunk 8
+#                        --layers 24:36 --role tail --chunk 8 --max-seq 768
 # (--chunk must equal gamma+1; --max-seq must match max_seq.)
+# Generate an identity on each node and exchange public certificates as described in README.md.
 
 model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for now)
 draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
 gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
-max_seq = 768                     # KV size on every shard (768 is the validated point)
+max_seq = 768                     # KV size on every shard; prompt + max_new must fit
 depth = 4                         # in-flight verify chunks (pipelining; hides WAN RTT)
 
 [[nodes]]          # head — this machine (potpori chat)

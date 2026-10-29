@@ -18,8 +18,8 @@ impl ChatTokenizer {
             .model(repo.to_string())
             .get("tokenizer.json")
             .with_context(|| format!("download tokenizer.json for {repo}"))?;
-        let inner = tokenizers::Tokenizer::from_file(&path)
-            .map_err(|e| anyhow!("load tokenizer: {e}"))?;
+        let inner =
+            tokenizers::Tokenizer::from_file(&path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
         Ok(Self { inner })
     }
 
@@ -29,14 +29,19 @@ impl ChatTokenizer {
         let text = format!(
             "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
-        let enc = self.inner.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?;
+        let enc = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
 
     /// Decode generated ids to text (skipping special tokens).
     pub fn decode(&self, ids: &[i32]) -> Result<String> {
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        self.inner.decode(&ids, true).map_err(|e| anyhow!("decode: {e}"))
+        self.inner
+            .decode(&ids, true)
+            .map_err(|e| anyhow!("decode: {e}"))
     }
 }
 
@@ -45,6 +50,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "downloads a tokenizer from Hugging Face"]
     fn prompt_ids_in_range() {
         let tok = ChatTokenizer::load("Qwen/Qwen3-4B").unwrap();
         for (name, p) in [

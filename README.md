@@ -1,102 +1,92 @@
 # potpori
 
-**Sharded LLM inference with your friends over WAN** — cut a model into layer shards, run each
-shard on a different machine, and generate with **lossless speculative decoding** pipelined over
-QUIC. A medley of GPUs.
+Sharded Qwen3 inference across friends' GPUs, with greedy speculative decoding over authenticated QUIC connections.
 
-Rust, on [Luminal](https://github.com/jafioti/luminal) (Metal + CUDA). One static binary — no
-Python, no Docker.
+Potpori is a Rust CLI on [Luminal](https://github.com/luminal-ai/luminal). The current dependency is pinned to upstream commit [`1cbb917`](https://github.com/luminal-ai/luminal/commit/1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1), the latest `main` checked on October 29, 2026. See [the migration notes](docs/luminal-migration.md) for the API changes and validation limits.
 
-## How it works
+## Architecture
 
-```
-   head (you)                    friend A                    friend B
-┌──────────────────┐        ┌───────────────┐          ┌────────────────────┐
-│ tokenizer        │ hidden │               │  hidden  │                    │
-│ embed + L[0,12)  │ ─────► │   L[12,24)    │ ───────► │ L[24,36) + lm_head │
-│ draft model (γ)  │  QUIC  │               │   QUIC   │                    │
-│ spec-decode loop │ ◄──────┴───────────────┴──────────│  argmax per pos    │
-└──────────────────┘              results              └────────────────────┘
+```text
+head: tokenizer + embeddings + first layers + draft model
+  → middle: next layers → tail: final layers + output projection
+  ← verification results relayed through the middle ←
 ```
 
-- **Pipeline-parallel**: contiguous layer shards; the residual-stream hidden state
-  (~2-12 KiB/token) hops node→node over QUIC bi-streams. Bandwidth is trivial — WAN **RTT** is
-  the enemy.
-- **Speculative decoding**: a small draft model on the head proposes γ tokens; the whole chain
-  verifies them in **one** traversal. Greedy token-id acceptance makes the output **bit-identical
-  to plain greedy decode** of the target — provably lossless, any draft quality.
-- **Depth-N pipelining**: several verify chunks stay in flight, chained on the draft's output —
-  throughput approaches per-stage compute instead of full-chain latency, hiding the RTT.
-- **KV rollback for free**: every shard writes its KV at absolute positions, so rejected
-  speculative tails are simply overwritten — no cache surgery, no `seq_rm`.
+The head proposes tokens with a small Qwen3 model. Each target shard verifies a chunk, returning the target's greedy token at every position. Accepted tokens match the target; rejected tails are overwritten at absolute KV positions. Only verified EOS tokens stop generation. Near cache capacity, the driver drains speculation and uses single-token verification.
 
-## Status
+Several chunks can remain in flight. Middle nodes forward new work independently of result relay using bounded queues. This enables stage overlap; it does not eliminate network latency. Results currently return through the chain.
 
-Early. What's here today, all verified lossless (bit-identical to single-process greedy) in the
-test suite:
+Supported configurations: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, and `Qwen/Qwen3-4B`. GLM/MoE, NVFP4, sampling, NAT traversal and session reconnection remain future work. Greedy equivalence also depends on the backend's numerical behavior across batch sizes; full-model parity must be validated for the intended hardware/configuration.
 
-- ✅ sync + depth-N pipelined spec-decode drivers (GPU-free unit tests)
-- ✅ 2-node and 3-node (head → middle → tail) chains over real QUIC — Qwen3-0.6B, Metal
-- ✅ real acceptance measured: Qwen3-0.6B drafting Qwen3-4B → 2.67 tok/traversal
-- ✅ Metal multi-token kernel cliff found + worked around (chunk-specialized kernels, ~20×)
-- ✅ CUDA substrate validated (A6000): builds, correct, **no** kernel cliff there
-- 🚧 `serve`/`chat` CLI (this repo's M0 — wiring the above into a usable tool)
-- 🔜 GLM-5.2 (744B, NVFP4) as the flagship target — the whole point; needs the big-GPU chain
-- 🔜 NAT traversal, reconnection, activation codecs, sampling (temperature) story
+## Build
 
-## Quickstart (a 3-machine chain)
+Use current stable Rust (Luminal requires at least Rust 1.91) and the platform's native build tools.
 
-Everyone builds the binary (Rust + a GPU):
-
-```bash
-# Apple Silicon                      # NVIDIA (CUDA toolkit >= 12.8 required)
-cargo build --release --features metal
-                                     cargo build --release --features cuda
+```sh
+cargo build --locked --release --features metal  # macOS / Apple Silicon
+cargo build --locked --release --features cuda   # NVIDIA
 ```
 
-Copy `chain.example.toml` → `chain.toml`, put your friends' addresses in (Tailscale IPs work
-great), split the layers. Friends start their shards (weights auto-download from HF):
+CUDA needs a compatible driver, CUDA toolkit headers including CCCL, NVRTC, and cuBLAS available to the dynamic loader. CUDA 12.9 was used for the local migration checks. `CUDA_PATH` / `CUDA_HOME` can identify the toolkit; `LUMINAL_CUDA_HEADERS_DIR` can point directly to its include directory. For an installation without `nvcc`, set `CUDARC_CUDA_VERSION` to the installed version (for example `12090` for 12.9).
 
-```bash
-# friend A (middle)
-potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B --layers 12:24 \
-              --role middle --downstream <friend-B>:4010 --chunk 8
-# friend B (tail)
-potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B --layers 24:36 --role tail --chunk 8
+The native graph uses F32 arithmetic and KV state on both backends, with explicit casts from BF16 checkpoint storage. `POTPORI_DTYPE` no longer selects arithmetic precision. Previous F16/BF16 performance measurements apply to the historical backend, not this migration.
+
+## Establish peer trust
+
+Generate a separate identity on each machine:
+
+```sh
+potpori identity --out identity
 ```
 
-Then chat from the head:
+Keep `identity/key.pem` private. Exchange `identity/cert.pem` through a trusted channel with your adjacent peers. Collect the peer certificates in `identity/peers.pem`, for example on the middle node:
 
-```bash
-potpori chat --chain chain.toml --prompt "explain speculative decoding in one paragraph"
+```sh
+cat head-cert.pem tail-cert.pem > identity/peers.pem
 ```
 
-First runs are slow to start: weights download once, and Luminal's kernel search compiles each
-shard (~minutes). Generation itself is the fast part.
+Both ends verify certificates. There is no insecure mode. The head needs the middle's certificate; the middle needs the head's and tail's certificates; the tail needs the middle's certificate. Custom paths are accepted by `serve` and `chat` through `--cert`, `--key`, and `--trust`.
 
-> `--chunk` must be `gamma + 1` from the chain config. On Metal it's required (the specialized
-> kernel is ~20× faster than the generic multi-token one); on CUDA you can pass `--chunk 0`.
+## Run a three-machine chain
 
-## Design notes
+Copy `chain.example.toml` to `chain.toml` on the head and edit the IP addresses. Every server's model, layer boundaries, cache capacity, and verification chunk must agree with the chain. The session handshake checks compatibility before processing activations.
 
-The `docs/` folder carries the full design + findings history: the pipeline/spec-decode design,
-chain formation, the substrate decision (why Luminal), and the CUDA runbook. Notable findings
-baked into the code:
+Start the tail, then the middle:
 
-- Metal has no bf16 load path at the pinned Luminal rev → weights run F16 on Metal, Bf16 on CUDA
-  (`MAIN_DTYPE`).
-- Luminal/Metal's generic dynamic-length forward kernel is ~20× slower than a fixed-size one →
-  shards compile **point buckets** for `s ∈ {1, γ+1}` (`Shard::load_chunked`). CUDA doesn't
-  need this (measured: no cliff).
-- QUIC teardown must be FIN-based (`finish()` + `wait_closed()`), or the last frame gets cut.
+```sh
+potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
+  --layers 24:36 --role tail --chunk 8 --max-seq 768
 
-## Lineage
+potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
+  --layers 12:24 --role middle --downstream 100.64.0.3:4010 \
+  --chunk 8 --max-seq 768
+```
 
-Successor-in-spirit to [dnet](https://github.com/firstbatchxyz/dnet) (Python/MLX pipeline
-engine for Apple Silicon), rebuilt in Rust on Luminal with WAN + speculative decoding as the
-core premise. Techniques adapted from [shard](https://github.com/leyten/shard) (async depth-N
-pipelining, direct-return ring) — see `docs/shard-adoption-brief.md`.
+Then run the head:
 
-## License
+```sh
+potpori chat --chain chain.toml --max-new 128 \
+  --prompt "Explain speculative decoding in one paragraph."
+```
 
-Apache-2.0
+`--chunk` must equal `gamma + 1`; `--max-seq` must equal `max_seq`. Tokenized prompt length plus `--max-new` must fit the cache. Fixed kernels cover one token and the verification chunk size. Configuration errors are rejected before loading model weights.
+
+The first run downloads and prepares weights, then searches GPU implementations for each bucket. Preparation currently downloads the whole model on each participant and combines its tensors in host memory; only the local shard's parameters are uploaded to its runtime. Allow host RAM and disk for preparation. Prepared files are validated and published by atomic replacement.
+
+## Checks
+
+```sh
+cargo test --locked                       # GPU-free coordination and QUIC tests
+cargo test --locked --features engine     # also model/loading checks; no GPU required
+cargo check --locked --features cuda --all-targets
+cargo clippy --locked --features cuda --all-targets -- -D warnings
+cargo test --locked --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
+```
+
+The tiny GPU test creates deterministic weights locally and checks an independent scalar CPU reference, shard equivalence, and KV rollback. Tests that download real Qwen weights or need a GPU are explicitly ignored by default. QUIC tests require local UDP access. Historical GPU tests remain available under the matching backend feature; their earlier results do not establish parity after a compiler upgrade.
+
+## Lineage and license
+
+Inspired by [dnet](https://github.com/firstbatchxyz/dnet) and [shard](https://github.com/leyten/shard). Historical design notes remain in `docs/`; the current implementation and migration notes take precedence over earlier proposed APIs and benchmarks.
+
+Apache-2.0. The native runtime/memory adapters are adapted from Luminal's MIT/Apache-2.0 examples at the pinned revision; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

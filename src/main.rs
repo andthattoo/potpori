@@ -10,13 +10,25 @@
 //!   - `potpori chat`  — the head: embeds + first shard + draft model + tokenizer, locally.
 
 // Without a backend feature these have no consumer (`run` is compiled out) — don't warn.
-#[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod chain;
-#[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod engine;
-#[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod specdecode;
-#[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod specpipe;
 mod transport;
 
@@ -28,6 +40,23 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+#[derive(clap::Args)]
+struct TlsArgs {
+    #[arg(long, default_value = "identity/cert.pem")]
+    cert: PathBuf,
+    #[arg(long, default_value = "identity/key.pem")]
+    key: PathBuf,
+    /// PEM bundle containing the certificates of trusted peers.
+    #[arg(long, default_value = "identity/peers.pem")]
+    trust: PathBuf,
+}
+impl TlsArgs {
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    fn load(&self) -> Result<transport::TlsIdentity> {
+        transport::TlsIdentity::load(&self.cert, &self.key, &self.trust)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -42,8 +71,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Generate this node's identity. Share cert.pem with peers; keep key.pem private.
+    Identity {
+        #[arg(long, default_value = "identity")]
+        out: PathBuf,
+    },
     /// Serve a shard of the chain (middle or tail) — run this on each friend's box.
     Serve {
+        #[command(flatten)]
+        tls: TlsArgs,
         /// Address to listen on, e.g. 0.0.0.0:4010
         #[arg(long)]
         listen: SocketAddr,
@@ -60,11 +96,10 @@ enum Cmd {
         #[arg(long)]
         downstream: Option<SocketAddr>,
         /// Max sequence length — sizes the KV cache (must match the chain config)
-        #[arg(long, default_value_t = 2048)]
+        #[arg(long, default_value_t = 768)]
         max_seq: usize,
-        /// Verify chunk size = γ+1. Compiles chunk-specialized kernels; 0 = generic dynamic
-        /// kernel. Metal NEEDS the specialized kernel (the generic multi-token kernel is ~20×
-        /// slower there); on CUDA 0 is fine. Must equal the chain's gamma+1.
+        /// Verify chunk size = γ+1. Compiles a specialized kernel alongside the single-token
+        /// kernel. Must equal the chain's gamma+1; 0 enables generic diagnostic buckets.
         #[arg(long, default_value_t = 8)]
         chunk: usize,
         /// Egglog search budget per shard load (kernel quality vs startup time)
@@ -73,6 +108,8 @@ enum Cmd {
     },
     /// Run the head: prompt in → sharded, spec-decoded generation out.
     Chat {
+        #[command(flatten)]
+        tls: TlsArgs,
         /// Path to the chain TOML (see chain.example.toml)
         #[arg(long, default_value = "chain.toml")]
         chain: PathBuf,
@@ -93,12 +130,17 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if let Cmd::Identity { out } = &cli.cmd {
+        transport::TlsIdentity::generate(out)?;
+        println!("Identity created in {}. Exchange cert.pem with peers and collect their certificates in peers.pem.", out.display());
+        return Ok(());
+    }
 
-    #[cfg(any(feature = "metal", feature = "cuda"))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     {
         run::dispatch(cli.cmd)
     }
-    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
     {
         let _ = cli.cmd;
         anyhow::bail!(
@@ -108,7 +150,7 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 mod run {
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -116,14 +158,14 @@ mod run {
     use anyhow::{anyhow, bail, Result};
 
     use crate::chain::ChainConfig;
-    use crate::qwen::distributed::{serve_middle, serve_tail, PipelinedQuicChain};
+    use crate::qwen::config_for;
+    use crate::qwen::distributed::{serve_middle_authenticated, serve_tail, PipelinedQuicChain};
     use crate::qwen::draft::IncrementalDraft;
     use crate::qwen::hf::prepare_hf_model;
     use crate::qwen::model::QwenConfig;
     use crate::qwen::shard::Shard;
     use crate::qwen::target::QwenTarget;
     use crate::qwen::tok::ChatTokenizer;
-    use crate::qwen::config_for;
     use crate::specdecode::SpecConfig;
     use crate::specpipe::run_spec_decode_pipelined;
     use crate::transport::listen_endpoint;
@@ -131,28 +173,51 @@ mod run {
 
     // Backend selection: CUDA wins if both features are enabled.
     #[cfg(feature = "cuda")]
-    type Backend = luminal_cuda_lite::runtime::CudaRuntime;
+    type Backend = crate::qwen::runtime::CudaRuntime;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    type Backend = luminal_metal::MetalRuntime;
+    type Backend = crate::qwen::runtime::MetalRuntime;
 
     fn new_runtime() -> Backend {
         #[cfg(feature = "cuda")]
         {
-            luminal_cuda_lite::runtime::CudaRuntime::new().expect("init CUDA runtime")
+            crate::qwen::runtime::CudaRuntime::new().expect("init CUDA runtime")
         }
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         {
-            use luminal::prelude::Runtime as _;
-            luminal_metal::MetalRuntime::initialize(())
+            crate::qwen::runtime::MetalRuntime::initialize(())
         }
     }
 
     pub fn dispatch(cmd: Cmd) -> Result<()> {
         match cmd {
-            Cmd::Serve { listen, model, layers, role, downstream, max_seq, chunk, search_graphs } => {
-                serve(listen, model, layers, role, downstream, max_seq, chunk, search_graphs)
-            }
-            Cmd::Chat { chain, prompt, max_new } => chat(chain, prompt, max_new),
+            Cmd::Serve {
+                listen,
+                model,
+                layers,
+                role,
+                downstream,
+                max_seq,
+                chunk,
+                search_graphs,
+                tls,
+            } => serve(
+                listen,
+                model,
+                layers,
+                role,
+                downstream,
+                max_seq,
+                chunk,
+                search_graphs,
+                tls.load()?,
+            ),
+            Cmd::Chat {
+                chain,
+                prompt,
+                max_new,
+                tls,
+            } => chat(chain, prompt, max_new, tls.load()?),
+            Cmd::Identity { .. } => unreachable!("handled before backend dispatch"),
         }
     }
 
@@ -162,7 +227,12 @@ mod run {
             .ok_or_else(|| anyhow!("unknown model {repo} — known: Qwen/Qwen3-{{0.6B,1.7B,4B}}"))?;
         tracing::info!("preparing weights for {repo} (downloads + combines on first run)…");
         let dir = prepare_hf_model(repo).map_err(|e| anyhow!("prepare {repo}: {e}"))?;
-        Ok((cfg, dir.join("model_combined_bf16_v1.safetensors").to_string_lossy().into_owned()))
+        Ok((
+            cfg,
+            dir.join("model_combined_bf16_v1.safetensors")
+                .to_string_lossy()
+                .into_owned(),
+        ))
     }
 
     fn parse_layers(s: &str) -> Result<(usize, usize)> {
@@ -182,6 +252,7 @@ mod run {
         max_seq: usize,
         chunk: usize,
         search_graphs: usize,
+        tls: crate::transport::TlsIdentity,
     ) -> Result<()> {
         let (a, b) = parse_layers(&layers)?;
         let is_last = match role.as_str() {
@@ -189,7 +260,16 @@ mod run {
             "middle" => false,
             r => bail!("--role must be tail or middle, got {r}"),
         };
-        let (cfg, wp) = weights_for(&model)?;
+        let cfg = config_for(&model).ok_or_else(|| anyhow!("unsupported model {model}"))?;
+        if a >= b
+            || b > cfg.layers
+            || max_seq == 0
+            || max_seq > i32::MAX as usize
+            || chunk > max_seq
+            || search_graphs == 0
+        {
+            bail!("invalid layer range, cache size, chunk, or search budget");
+        }
         if a == 0 {
             bail!("layer 0 belongs to the head — run `potpori chat` on the head instead");
         }
@@ -199,6 +279,10 @@ mod run {
         if !is_last && downstream.is_none() {
             bail!("--downstream is required for middles");
         }
+        if !is_last && b == cfg.layers {
+            bail!("middle cannot own the final model layer");
+        }
+        let (_, wp) = weights_for(&model)?;
 
         tracing::info!("loading shard [{a},{b}) of {model} — egglog kernel search, takes minutes…");
         let mut shard = Shard::load_chunked(
@@ -218,7 +302,7 @@ mod run {
             .build()?;
         let ep = {
             let _g = rt.enter();
-            listen_endpoint(listen).map_err(|e| anyhow!("listen on {listen}: {e}"))?
+            listen_endpoint(listen, &tls).map_err(|e| anyhow!("listen on {listen}: {e}"))?
         };
         tracing::info!("shard ready — serving [{a},{b}) as {role} on {listen}");
         loop {
@@ -226,7 +310,7 @@ mod run {
             let res = if is_last {
                 serve_tail(&mut shard, &ep, &rt)
             } else {
-                serve_middle(&mut shard, &ep, downstream.unwrap(), &rt)
+                serve_middle_authenticated(&mut shard, &ep, downstream.unwrap(), &rt, &tls)
             };
             match res {
                 Ok(()) => tracing::info!("session ended cleanly — waiting for the next head"),
@@ -235,13 +319,28 @@ mod run {
         }
     }
 
-    fn chat(chain_path: PathBuf, prompt: String, max_new: usize) -> Result<()> {
+    fn chat(
+        chain_path: PathBuf,
+        prompt: String,
+        max_new: usize,
+        tls: crate::transport::TlsIdentity,
+    ) -> Result<()> {
         let cc = ChainConfig::load(&chain_path)?;
         let chunk = cc.gamma + 1;
+        if max_new == 0 {
+            return Ok(());
+        }
 
         // Tokenize first (fast) so config errors surface before the slow loads.
         let tok = ChatTokenizer::load(&cc.model)?;
         let ids = tok.encode_chat(&prompt)?;
+        if ids
+            .len()
+            .checked_add(max_new)
+            .is_none_or(|n| n > cc.max_seq)
+        {
+            bail!("prompt ({} tokens) plus --max-new {max_new} exceeds max_seq {}; shorten the request or increase the cache", ids.len(), cc.max_seq);
+        }
 
         let (dcfg, dwp) = weights_for(&cc.draft_model)?;
         tracing::info!("loading draft model {}…", cc.draft_model);
@@ -251,7 +350,7 @@ mod run {
             &dwp,
             cc.max_seq,
             cc.search_graphs,
-            chunk, // point buckets {1, γ+1} — the generic dynamic bucket miscompiles on Metal
+            chunk, // point buckets {1, γ+1}, shared by draft, head and remote shards
         );
 
         let (tcfg, twp) = weights_for(&cc.model)?;
@@ -275,16 +374,9 @@ mod run {
         );
         let mut draft = IncrementalDraft::new(draft_target, chunk);
         {
-            // Sanity: all-NaN logits argmax to token 0. Probe with a 1-token draft (this also
-            // warm-feeds the prompt into the draft's KV — not wasted work).
+            // Argmax now rejects non-finite logits directly; token zero is a valid prediction.
             use crate::engine::DraftEngine as _;
             let probe = draft.draft(&ids, 1);
-            if probe[0] == 0 {
-                bail!(
-                    "draft sanity check failed: first prediction is token 0 (all-NaN logits?). \
-                     A Luminal kernel for this config miscompiled — try a different max_seq."
-                );
-            }
             tracing::info!("draft sanity check ok (first prediction = {})", probe[0]);
         }
 
@@ -294,7 +386,7 @@ mod run {
             .expect("validated: remote nodes have addrs")
             .parse()?;
         tracing::info!("prompt = {} tokens; dialing {next_addr}…", ids.len());
-        let mut chain = PipelinedQuicChain::connect(vec![head], next_addr)
+        let mut chain = PipelinedQuicChain::connect_authenticated(vec![head], next_addr, &tls)
             .map_err(|e| anyhow!("dial {next_addr}: {e}"))?;
         chain.set_prefill_chunk(chunk);
 
@@ -303,7 +395,10 @@ mod run {
             &mut draft,
             &mut chain,
             &ids,
-            &SpecConfig { gamma: cc.gamma, max_new },
+            &SpecConfig {
+                gamma: cc.gamma,
+                max_new,
+            },
             cc.depth,
         );
         let dt = t0.elapsed().as_secs_f64();

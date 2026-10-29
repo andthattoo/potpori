@@ -1,7 +1,7 @@
 use half::{bf16, f16};
 use hf_hub::api::sync::Api;
 use memmap2::MmapOptions;
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -41,15 +41,24 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
     let data = tensor.data();
 
     match dtype {
-        Dtype::F32 => bytemuck::cast_slice::<u8, f32>(data).to_vec(),
-        Dtype::F16 => {
-            let f16_slice: &[f16] = bytemuck::cast_slice(data);
-            f16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        Dtype::BF16 => {
-            let bf16_slice: &[bf16] = bytemuck::cast_slice(data);
-            bf16_slice.iter().map(|x| x.to_f32()).collect()
-        }
+        Dtype::F32 => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        Dtype::F16 => data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect(),
+        Dtype::BF16 => data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect(),
         other => {
             panic!("Unsupported dtype for conversion: {other:?}");
         }
@@ -118,7 +127,7 @@ fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::erro
 
 /// Combines sharded safetensors into a single bf16 file (norm weights kept
 /// F32). Linear projections, the token embedding and the lm_head are bf16; the
-/// model is pure HLIR and the e-graph rewrites pick up the bf16 matmuls.
+/// graph explicitly converts checkpoint storage to F32 arithmetic.
 ///
 /// Qwen3-4B ties the lm_head to the embedding table, so no separate
 /// `lm_head.weight` is stored — the model reuses `model.embed_tokens.weight`.
@@ -127,7 +136,7 @@ pub fn combine_safetensors_to_bf16(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
 
-    if output_path.exists() {
+    if valid_combined_file(&output_path) {
         let existing_bytes = std::fs::metadata(&output_path)?.len();
         println!(
             "Using existing combined BF16 model at {} ({})",
@@ -173,11 +182,65 @@ pub fn combine_safetensors_to_bf16(
 
     let serialized = safetensors::serialize(&tensor_views, None)?;
 
-    let mut file = File::create(&output_path)?;
-    file.write_all(&serialized)?;
+    publish_atomic(&output_path, &serialized)?;
 
     println!("Combined BF16 model saved successfully!");
     Ok(output_path)
+}
+
+fn valid_combined_file(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: files published by this module are immutable after an atomic rename.
+    let Ok(mmap) = (unsafe { MmapOptions::new().map(&file) }) else {
+        return false;
+    };
+    SafeTensors::deserialize(&mmap).is_ok_and(|st| !st.is_empty())
+}
+
+fn publish_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Load only this shard's declared parameter ports. Byte decoding does not assume mmap alignment.
+pub fn load_inputs(
+    graph: &super::model::QwenGraph,
+    path: &Path,
+) -> anyhow::Result<super::model::Inputs> {
+    use super::model::{Inputs, TensorData};
+    use luminal::dtype::DType;
+    let file = File::open(path)?;
+    // SAFETY: the prepared model is immutable and remains mapped throughout decoding.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)?;
+    let mut inputs = Inputs::default();
+    for p in &graph.parameters {
+        let tensor = tensors.tensor(&p.name)?;
+        anyhow::ensure!(tensor.shape() == p.shape, "shape mismatch for {}", p.name);
+        let data = match p.dtype {
+            DType::Bf16 => {
+                anyhow::ensure!(tensor.dtype() == Dtype::BF16, "expected BF16 {}", p.name);
+                TensorData::BF16(
+                    tensor
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect(),
+                )
+            }
+            DType::F32 => TensorData::F32(tensor_to_f32(&tensor)),
+            _ => anyhow::bail!("unsupported parameter dtype"),
+        };
+        inputs.insert(p.input, data);
+    }
+    Ok(inputs)
 }
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
@@ -216,4 +279,22 @@ pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Er
     let model_dir = download_hf_model(repo_id)?;
     combine_safetensors_to_bf16(&model_dir)?;
     Ok(model_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn atomic_publish_replaces_corrupt_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("combined.safetensors");
+        std::fs::write(&path, b"interrupted").unwrap();
+        assert!(!valid_combined_file(&path));
+        let data = 1f32.to_le_bytes();
+        let view = TensorView::new(Dtype::F32, vec![1], &data).unwrap();
+        let bytes = safetensors::serialize([("weight", view)], None).unwrap();
+        publish_atomic(&path, &bytes).unwrap();
+        assert!(valid_combined_file(&path));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 }

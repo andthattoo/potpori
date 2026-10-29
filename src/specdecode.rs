@@ -49,7 +49,17 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     prompt: &[TokenId],
     cfg: &SpecConfig,
 ) -> (Vec<TokenId>, SpecStats) {
-    let gamma = cfg.gamma.max(1);
+    assert!(cfg.gamma > 0, "gamma must be positive");
+    if cfg.max_new == 0 {
+        return (Vec::new(), SpecStats::default());
+    }
+    let capacity = target.capacity().min(draft.capacity());
+    assert!(
+        !prompt.is_empty() && prompt.len() < capacity,
+        "prompt must leave room in the KV cache"
+    );
+    let max_new = cfg.max_new.min(capacity - prompt.len());
+    let gamma = cfg.gamma;
     let mut out: Vec<TokenId> = Vec::new();
     let mut traversals = 0usize;
 
@@ -58,7 +68,7 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     let mut base = prompt.len() as u32; // absolute KV position where `cur` is fed
 
     'gen: loop {
-        if target.is_eos(cur) || out.len() >= cfg.max_new {
+        if target.is_eos(cur) || out.len() >= max_new {
             break;
         }
 
@@ -67,12 +77,20 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
         context.extend_from_slice(prompt);
         context.extend_from_slice(&out);
         context.push(cur);
-        let drafts = draft.draft(&context, gamma);
+        let drafts = if capacity.saturating_sub(base as usize) <= gamma {
+            Vec::new()
+        } else {
+            draft.draft(&context, gamma)
+        };
 
         // One chain traversal: verify [cur] + drafts at positions [base, base+drafts.len()].
         // `r[j]` = target greedy argmax after the j-th fed token (length drafts.len()+1).
         let r = target.verify(base, cur, &drafts);
-        debug_assert_eq!(r.len(), drafts.len() + 1, "verify must return drafts.len()+1 argmaxes");
+        assert_eq!(
+            r.len(),
+            drafts.len() + 1,
+            "verify must return drafts.len()+1 argmaxes"
+        );
         traversals += 1;
 
         // Accept the longest prefix where the draft matched the target's argmax.
@@ -90,7 +108,7 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
                 break 'gen;
             }
             out.push(t);
-            if out.len() >= cfg.max_new {
+            if out.len() >= max_new {
                 break 'gen;
             }
         }
@@ -106,7 +124,13 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     }
 
     let committed = out.len();
-    (out, SpecStats { committed, traversals })
+    (
+        out,
+        SpecStats {
+            committed,
+            traversals,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -151,7 +175,9 @@ mod tests {
         fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
             // context = prompt ++ out ++ [cur]; next truth index to draft = context.len()-prompt_len.
             let l = context.len() - self.prompt_len;
-            (0..gamma).map(|j| *self.truth.get(l + j).unwrap_or(&-1)).collect()
+            (0..gamma)
+                .map(|j| *self.truth.get(l + j).unwrap_or(&-1))
+                .collect()
         }
     }
 
@@ -168,25 +194,49 @@ mod tests {
         let truth: Vec<TokenId> = (1..=60).collect(); // the target's greedy ground truth
         let eos = 9999;
         let prompt = vec![100, 101, 102];
-        let cfg = SpecConfig { gamma: 4, max_new: 40 };
+        let cfg = SpecConfig {
+            gamma: 4,
+            max_new: 40,
+        };
         let expected: Vec<TokenId> = truth[..cfg.max_new].to_vec();
 
         // Perfect draft → full acceptance, but output is exactly greedy truth.
-        let mut t = SyntheticTarget { truth: truth.clone(), prompt_len: 0, eos };
-        let mut d = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let mut t = SyntheticTarget {
+            truth: truth.clone(),
+            prompt_len: 0,
+            eos,
+        };
+        let mut d = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
         let (out_perfect, sp) = run_spec_decode(&mut d, &mut t, &prompt, &cfg);
 
         // Garbage draft → zero acceptance, output STILL exactly greedy truth (losslessness).
-        let mut t2 = SyntheticTarget { truth: truth.clone(), prompt_len: 0, eos };
+        let mut t2 = SyntheticTarget {
+            truth: truth.clone(),
+            prompt_len: 0,
+            eos,
+        };
         let mut g = GarbageDraft;
         let (out_garbage, sg) = run_spec_decode(&mut g, &mut t2, &prompt, &cfg);
 
-        assert_eq!(out_perfect, expected, "perfect-draft output must equal greedy truth");
-        assert_eq!(out_garbage, expected, "garbage-draft output must STILL equal greedy truth");
+        assert_eq!(
+            out_perfect, expected,
+            "perfect-draft output must equal greedy truth"
+        );
+        assert_eq!(
+            out_garbage, expected,
+            "garbage-draft output must STILL equal greedy truth"
+        );
 
         // Acceptance changes SPEED, never correctness: perfect commits gamma+1/traversal,
         // garbage commits exactly 1/traversal.
-        assert_eq!(sg.toks_per_traversal(), 1.0, "garbage draft = 1 token/traversal");
+        assert_eq!(
+            sg.toks_per_traversal(),
+            1.0,
+            "garbage draft = 1 token/traversal"
+        );
         assert!(
             sp.toks_per_traversal() > sg.toks_per_traversal(),
             "perfect draft must be faster ({} vs {})",
@@ -202,12 +252,26 @@ mod tests {
         let eos = 9999;
         let truth: Vec<TokenId> = vec![1, 2, 3, 4, 5, eos];
         let prompt = vec![7, 8];
-        let cfg = SpecConfig { gamma: 4, max_new: 100 };
+        let cfg = SpecConfig {
+            gamma: 4,
+            max_new: 100,
+        };
 
-        let mut t = SyntheticTarget { truth: truth.clone(), prompt_len: 0, eos };
-        let mut d = PerfectDraft { truth: truth.clone(), prompt_len: prompt.len() };
+        let mut t = SyntheticTarget {
+            truth: truth.clone(),
+            prompt_len: 0,
+            eos,
+        };
+        let mut d = PerfectDraft {
+            truth: truth.clone(),
+            prompt_len: prompt.len(),
+        };
         let (out, _) = run_spec_decode(&mut d, &mut t, &prompt, &cfg);
 
-        assert_eq!(out, vec![1, 2, 3, 4, 5], "must stop before EOS, not emit it");
+        assert_eq!(
+            out,
+            vec![1, 2, 3, 4, 5],
+            "must stop before EOS, not emit it"
+        );
     }
 }

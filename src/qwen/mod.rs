@@ -24,13 +24,15 @@ use model::QwenConfig;
 
 /// Map an HF repo name to a known Qwen3 config.
 pub fn config_for(repo: &str) -> Option<QwenConfig> {
-    if repo.contains("0.6B") {
+    if repo == "Qwen/Qwen3-0.6B" {
         Some(QwenConfig::QWEN3_0_6B)
-    } else if repo.contains("1.7B") {
+    } else if repo == "Qwen/Qwen3-1.7B" {
         Some(QwenConfig::QWEN3_1_7B)
-    } else if repo.contains("4B") {
+    } else if repo == "Qwen/Qwen3-4B" {
         Some(QwenConfig::QWEN3_4B)
     } else {
         None
     }
 }
+
+pub mod runtime;

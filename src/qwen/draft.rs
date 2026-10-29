@@ -28,7 +28,11 @@ pub struct IncrementalDraft<R: QwenRuntime + 'static> {
 
 impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
     pub fn new(model: QwenTarget<R>, chunk: usize) -> Self {
-        Self { model, chunk, fed: Vec::new() }
+        Self {
+            model,
+            chunk,
+            fed: Vec::new(),
+        }
     }
 
     /// Feed `ctx[from..to]` at absolute positions `from..to` in point-bucket-sized pieces;
@@ -37,9 +41,17 @@ impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
         let mut pos = from;
         let mut last = 0;
         while pos < to {
-            let take = if self.chunk > 1 && to - pos >= self.chunk { self.chunk } else { 1 };
+            let take = if self.chunk > 1 && to - pos >= self.chunk {
+                self.chunk
+            } else {
+                1
+            };
             let piece = &ctx[pos..pos + take];
-            last = *self.model.verify(pos as u32, piece[0], &piece[1..]).last().unwrap();
+            last = *self
+                .model
+                .verify(pos as u32, piece[0], &piece[1..])
+                .last()
+                .unwrap();
             pos += take;
         }
         last
@@ -47,6 +59,9 @@ impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
 }
 
 impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
+    fn capacity(&self) -> usize {
+        self.model.capacity()
+    }
     fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
         let n = context.len();
         debug_assert!(n > 0, "draft called with empty context");
@@ -63,7 +78,10 @@ impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
         let start = agree.min(n.saturating_sub(1));
 
         if std::env::var("POTPORI_DEBUG").is_ok() && n < 120 {
-            eprintln!("[dbg-draft] n={n} agree={agree} start={start} tail_ctx={:?}", &context[n.saturating_sub(3)..]);
+            eprintln!(
+                "[dbg-draft] n={n} agree={agree} start={start} tail_ctx={:?}",
+                &context[n.saturating_sub(3)..]
+            );
         }
         let mut cur = self.feed_range(context, start, n);
         self.fed.truncate(start);
@@ -73,12 +91,10 @@ impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
         // feeds the PREVIOUS draft token, so all but the last land in the KV → record them.
         let mut out = Vec::with_capacity(gamma);
         out.push(cur);
-        let mut pos = n as u32;
-        for _ in 1..gamma {
+        for (pos, _) in (n as u32..).zip(1..gamma) {
             self.fed.push(cur); // `cur` is fed at `pos` by this verify call
             cur = self.model.verify(pos, cur, &[])[0];
             out.push(cur);
-            pos += 1;
         }
         out
     }

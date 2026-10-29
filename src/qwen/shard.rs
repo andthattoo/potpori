@@ -1,213 +1,124 @@
-//! Pipeline-parallel sharding of the Qwen model — the node→node "cut".
-//!
-//! A [`Shard`] runs a contiguous global layer range on its own Luminal graph + KV cache. The
-//! first shard embeds token-ids; non-first shards take a residual stream as input. The last
-//! shard applies the final norm + tied lm_head and emits logits; non-last shards emit the
-//! residual stream (`[seq, hidden]` F16) to hand to the next shard. [`ShardedChain`] wires N
-//! shards in sequence and implements [`TargetChain`], so `run_spec_decode` drives a sharded
-//! model unchanged.
-//!
-//! Hidden state is handed shard→shard IN-PROCESS here (as a `Vec<f32>`); the QUIC transport
-//! (`transport.rs`) replaces that one hop with a wire send. The round-trip is lossless: the F16
-//! boundary tensor → `get_f32` (F16→F32 exact) → `set_f32_data` (F32→F16 exact, since the data
-//! originated as F16). This is the "free cut" the substrate decision rests on, on a real model.
-#![allow(dead_code)] // Shard/ShardedChain are consumed by the cut test + (next) the QUIC transport.
-
-use luminal::prelude::*;
-
-use super::model::{KVCache, QwenConfig, QwenShard};
+//! Contiguous Qwen layer shards on the native Luminal runtime.
+#![allow(dead_code)]
+use super::model::{QwenConfig, QwenGraph, TensorData};
 use super::target::{argmax, QwenRuntime};
 use crate::engine::{TargetChain, TokenId};
-
-const EOS_TOKEN: i32 = 151645; // <|im_end|>
-const STOP_TOKEN: i32 = 151643; // <|endoftext|>
-
-/// What a shard consumes: token-ids (first shard) or a residual stream (non-first shard).
+const EOS_TOKEN: i32 = 151645;
+const STOP_TOKEN: i32 = 151643;
 enum ShardInput {
     Tokens(Vec<i32>),
     Hidden(Vec<f32>),
 }
-
-/// One pipeline shard: a global layer range on its own Luminal graph + runtime + KV cache.
 pub struct Shard<R: QwenRuntime> {
-    cx: Graph,
+    graph: QwenGraph,
     runtime: R,
-    input: GraphTensor,   // Int token-ids ([s]) if first, else F16 hidden ([s, hidden])
-    pos_ids: GraphTensor, // absolute positions
-    out: GraphTensor,     // F32 logits ([s, vocab]) if last, else F16 hidden ([s, hidden])
-    kv_cache: KVCache,
-    cache_outputs: Vec<(GraphTensor, GraphTensor)>,
     cfg: QwenConfig,
     is_first: bool,
     is_last: bool,
-    n_layers: usize,
-    max_seq_len: usize,
+    range: (usize, usize),
 }
-
 impl<R: QwenRuntime + 'static> Shard<R> {
-    /// Build this shard's graph with the GENERIC `s` bucket (`[2,max]` — slow multi-token kernel;
-    /// see [`load_chunked`](Self::load_chunked) for the fast specialized path).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         runtime: R,
         cfg: QwenConfig,
         range: (usize, usize),
-        is_first: bool,
-        is_last: bool,
-        weights_path: &str,
-        max_seq_len: usize,
-        search_graphs: usize,
+        first: bool,
+        last: bool,
+        path: &str,
+        capacity: usize,
+        search: usize,
     ) -> Self {
-        Self::load_chunked(
-            runtime, cfg, range, is_first, is_last, weights_path, max_seq_len, search_graphs, 0,
-        )
+        Self::load_chunked(runtime, cfg, range, first, last, path, capacity, search, 0)
     }
-
-    /// Like [`load`](Self::load), but `chunk_size > 0` compiles SPECIALIZED point buckets
-    /// `[1,1] + [chunk_size,chunk_size]` for the fixed spec-decode chunk size (γ+1). On Metal this
-    /// is ~16× faster than the generic dynamic `[2,max]` kernel (the multi-token-kernel perf bug:
-    /// s=8 generic ≈ 2300ms vs specialized ≈ 138ms). Only `s ∈ {1, chunk_size}` may be fed.
     #[allow(clippy::too_many_arguments)]
     pub fn load_chunked(
         mut runtime: R,
         cfg: QwenConfig,
         range: (usize, usize),
-        is_first: bool,
-        is_last: bool,
-        weights_path: &str,
-        max_seq_len: usize,
-        search_graphs: usize,
-        chunk_size: usize,
+        first: bool,
+        last: bool,
+        path: &str,
+        capacity: usize,
+        search: usize,
+        chunk: usize,
     ) -> Self {
-        let n_layers = range.1 - range.0;
-        let mut cx = Graph::default();
-        let input = if is_first {
-            cx.named_tensor("input", 's').as_dtype(DType::Int)
-        } else {
-            cx.named_tensor("input", ('s', cfg.hidden)).as_dtype(super::model::main_dtype())
-        };
-        let pos_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
-        let kv_cache = KVCache::new(&mut cx, &cfg, max_seq_len, n_layers);
-        let (out, cache_outputs) =
-            QwenShard::init(&mut cx, cfg, range, is_first, is_last).forward(input, pos_ids, &kv_cache);
-        let out = out.output();
-        for (k, v) in &cache_outputs {
-            k.output();
-            v.output();
-        }
-
-        let search_s = 8usize;
-        let s_buckets = if chunk_size == 0 {
-            vec![DimBucket::new(1, 1), DimBucket::new(2, max_seq_len).representative(search_s)]
-        } else {
-            // Two POINT buckets — s=1 + s=chunk_size, both specialized (fast), no dynamic range.
-            vec![DimBucket::new(1, 1), DimBucket::new(chunk_size, chunk_size)]
-        };
-        let rep_s = if chunk_size == 0 { search_s } else { chunk_size };
-        let compile_options = CompileOptions::default().dim_buckets('s', &s_buckets).dim_buckets(
-            'p',
-            &[DimBucket::new(0, 0), DimBucket::new(1, max_seq_len).representative(search_s)],
-        );
-        cx.build_search_space::<R>(compile_options);
-        runtime.load_safetensors(&cx, weights_path);
-
-        let cache_bytes = cfg.n_kv_heads * max_seq_len * cfg.head_dim * (super::model::main_dtype().bits() / 8);
-        for i in 0..n_layers {
-            runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
-            runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
-        }
-
-        // Representative inputs for the search (it executes candidate genomes); size to the
-        // largest bucket so every bucket's profile run has a big-enough buffer.
-        cx.set_dim('s', rep_s);
-        cx.set_dim('p', 0);
-        if is_first {
-            runtime.set_i32_data(input.id, vec![1i32; rep_s]);
-        } else {
-            runtime.set_f32_data(input.id, vec![0.02f32; rep_s * cfg.hidden]);
-        }
-        runtime.set_i32_data(pos_ids.id, (0..rep_s as i32).collect());
-        let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-        runtime = cx.search(runtime, search_options);
-
-        for i in 0..n_layers {
-            runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
-            runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
-        }
-
+        let graph = QwenGraph::build(cfg, range, first, last, capacity, chunk)
+            .expect("invalid shard configuration");
+        let weights =
+            super::hf::load_inputs(&graph, std::path::Path::new(path)).expect("load shard weights");
+        runtime
+            .compile(&graph, weights, search)
+            .expect("compile shard");
         Self {
-            cx,
+            graph,
             runtime,
-            input,
-            pos_ids,
-            out,
-            kv_cache,
-            cache_outputs,
             cfg,
-            is_first,
-            is_last,
-            n_layers,
-            max_seq_len,
+            is_first: first,
+            is_last: last,
+            range,
         }
     }
-
-    /// Run `s` positions starting at absolute `start_pos`; advance the KV; return the output
-    /// (`[s, vocab]` logits if last shard, else `[s, hidden]` residual stream) flattened.
     fn run_chunk(&mut self, start_pos: u32, s: usize, input: ShardInput) -> Vec<f32> {
-        self.cx.set_dim('s', s);
-        self.cx.set_dim('p', start_pos as usize);
-        match input {
-            ShardInput::Tokens(t) => self.runtime.set_i32_data(self.input.id, t),
-            ShardInput::Hidden(h) => self.runtime.set_f32_data(self.input.id, h),
-        }
+        let data = match input {
+            ShardInput::Tokens(t) => TensorData::I32(t),
+            ShardInput::Hidden(h) => TensorData::F32(h),
+        };
+        let inputs = self
+            .graph
+            .step_inputs(data, s, start_pos as usize)
+            .expect("invalid shard input");
         self.runtime
-            .set_i32_data(self.pos_ids.id, (start_pos as i32..start_pos as i32 + s as i32).collect());
-        self.runtime.prepare_execute(&self.cx.dyn_map);
-        self.runtime.execute(&self.cx.dyn_map);
-        let out_data = self.runtime.get_f32(self.out.id);
-        // Swap the updated per-layer KV (output) back into the input cache slots.
-        for (i, (k_out, v_out)) in self.cache_outputs.iter().enumerate() {
-            let kb = self.runtime.remove_buffer(k_out.id);
-            let vb = self.runtime.remove_buffer(v_out.id);
-            self.runtime.set_buffer(self.kv_cache.k_caches[i].id, kb);
-            self.runtime.set_buffer(self.kv_cache.v_caches[i].id, vb);
-        }
-        out_data
+            .step(inputs, s, start_pos as usize + s)
+            .expect("execute shard")
     }
-
     pub fn reset(&mut self) {
-        let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * (super::model::main_dtype().bits() / 8);
-        for i in 0..self.n_layers {
-            self.runtime.set_zeros(self.kv_cache.k_caches[i].id, cache_bytes);
-            self.runtime.set_zeros(self.kv_cache.v_caches[i].id, cache_bytes);
-        }
+        self.runtime.reset().expect("reset KV");
     }
-
-    /// First shard: embed `tokens` (absolute positions from `start_pos`), run the shard, return
-    /// the residual stream `[s, hidden]` flat.
-    pub fn forward_tokens(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<f32> {
-        self.run_chunk(start_pos, tokens.len(), ShardInput::Tokens(tokens.to_vec()))
+    pub fn forward_tokens(&mut self, pos: u32, tokens: &[TokenId]) -> Vec<f32> {
+        self.run_chunk(pos, tokens.len(), ShardInput::Tokens(tokens.to_vec()))
     }
-
-    /// Non-first shard: consume a residual stream (`s` positions from `start_pos`), run the shard,
-    /// return the residual stream (or logits `[s, vocab]` if this is the last shard) flat.
-    pub fn forward_hidden(&mut self, start_pos: u32, s: usize, hidden: Vec<f32>) -> Vec<f32> {
-        self.run_chunk(start_pos, s, ShardInput::Hidden(hidden))
+    pub fn forward_hidden(&mut self, pos: u32, s: usize, hidden: Vec<f32>) -> Vec<f32> {
+        self.run_chunk(pos, s, ShardInput::Hidden(hidden))
     }
-
     pub fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
     }
-
     pub fn hidden_dim(&self) -> usize {
         self.cfg.hidden
     }
-
     pub fn is_last(&self) -> bool {
         self.is_last
     }
+    pub fn capacity(&self) -> usize {
+        self.graph.capacity
+    }
+    pub fn chunk_size(&self) -> usize {
+        self.graph.chunk_size
+    }
+    pub fn range(&self) -> (usize, usize) {
+        self.range
+    }
+    pub fn model_layers(&self) -> usize {
+        self.cfg.layers
+    }
+    pub fn hello(&self, next_layer: usize) -> crate::transport::SessionHello {
+        crate::transport::SessionHello {
+            model: format!(
+                "qwen3:{}:{}:{}:{}:{}:{}",
+                self.cfg.layers,
+                self.cfg.hidden,
+                self.cfg.intermediate,
+                self.cfg.head_dim,
+                self.cfg.n_heads,
+                self.cfg.n_kv_heads
+            ),
+            next_layer,
+            max_seq: self.capacity(),
+            chunk: self.chunk_size(),
+        }
+    }
 }
-
 /// A node chain: shards run in sequence, each consuming the previous shard's output. Implements
 /// [`TargetChain`] so the spec-decode driver drives the sharded model unchanged. In-process
 /// hidden-state hand-off (the QUIC transport replaces the shard→shard hop).
@@ -220,7 +131,10 @@ impl<R: QwenRuntime + 'static> ShardedChain<R> {
     pub fn new(shards: Vec<Shard<R>>) -> Self {
         assert!(!shards.is_empty(), "a chain needs at least one shard");
         assert!(shards[0].is_first, "first shard must embed tokens");
-        assert!(shards.last().unwrap().is_last, "last shard must emit logits");
+        assert!(
+            shards.last().unwrap().is_last,
+            "last shard must emit logits"
+        );
         let vocab_size = shards[0].cfg.vocab_size;
         Self { shards, vocab_size }
     }
@@ -252,6 +166,9 @@ impl<R: QwenRuntime + 'static> ShardedChain<R> {
 }
 
 impl<R: QwenRuntime + 'static> TargetChain for ShardedChain<R> {
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(Shard::capacity).min().unwrap()
+    }
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
         let logits = self.run(0, prompt);
         let v = self.vocab_size;
@@ -265,7 +182,9 @@ impl<R: QwenRuntime + 'static> TargetChain for ShardedChain<R> {
         chunk.extend_from_slice(drafts);
         let logits = self.run(start_pos, &chunk);
         let v = self.vocab_size;
-        (0..chunk.len()).map(|j| argmax(&logits[j * v..(j + 1) * v])).collect()
+        (0..chunk.len())
+            .map(|j| argmax(&logits[j * v..(j + 1) * v]))
+            .collect()
     }
 
     fn truncate(&mut self, _keep_to_pos: u32) {
@@ -307,13 +226,18 @@ mod tests {
         let wp = w.to_str().unwrap();
 
         // Single-process baseline.
-        let mut full =
-            QwenTarget::load(luminal_metal::MetalRuntime::initialize(()), cfg, wp, 512, 200);
+        let mut full = QwenTarget::load(
+            crate::qwen::runtime::MetalRuntime::initialize(()),
+            cfg,
+            wp,
+            512,
+            200,
+        );
 
         // 2-shard chain: layers [0,k) (first) -> [k,L) (last).
         let k = cfg.layers / 2;
         let s0 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (0, k),
             true,
@@ -323,7 +247,7 @@ mod tests {
             200,
         );
         let s1 = Shard::load(
-            luminal_metal::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::initialize(()),
             cfg,
             (k, cfg.layers),
             false,

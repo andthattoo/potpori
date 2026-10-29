@@ -1,0 +1,28 @@
+name: checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  portable:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo test --locked --features engine
+      - run: cargo clippy --locked --features engine --all-targets -- -D warnings
+      - if: runner.os == 'macOS'
+        run: cargo check --locked --features metal --all-targets
+  cuda-build:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y curl build-essential pkg-config git ca-certificates
+      - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - run: /root/.cargo/bin/cargo check --locked --features cuda --all-targets

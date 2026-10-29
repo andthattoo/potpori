@@ -50,7 +50,14 @@ fn default_gamma() -> usize {
     7
 }
 fn default_max_seq() -> usize {
-    2048
+    768
+}
+pub fn model_layers(repo: &str) -> Option<usize> {
+    match repo {
+        "Qwen/Qwen3-0.6B" | "Qwen/Qwen3-1.7B" => Some(28),
+        "Qwen/Qwen3-4B" => Some(36),
+        _ => None,
+    }
 }
 fn default_depth() -> usize {
     4
@@ -69,11 +76,34 @@ impl ChainConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        let layers = model_layers(&self.model)
+            .ok_or_else(|| anyhow::anyhow!("unsupported target model {}", self.model))?;
+        if model_layers(&self.draft_model).is_none() {
+            bail!("unsupported draft model {}", self.draft_model);
+        }
+        if self.gamma == 0 || self.gamma.checked_add(1).is_none_or(|c| c > self.max_seq) {
+            bail!("require 1 <= gamma < max_seq");
+        }
+        if self.max_seq > i32::MAX as usize
+            || self.depth == 0
+            || self.depth > 64
+            || self.search_graphs == 0
+        {
+            bail!("invalid max_seq, depth (1..64), or search_graphs");
+        }
         if self.nodes.len() < 2 {
             bail!("a chain needs at least 2 nodes (a local head + a remote tail)");
         }
         if self.nodes[0].layers[0] != 0 {
             bail!("the first node is the head and must start at layer 0");
+        }
+        if self.nodes.last().unwrap().layers[1] != layers {
+            bail!("chain must cover all {layers} model layers");
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.layers[0] >= n.layers[1] || n.layers[1] > layers {
+                bail!("invalid layer range on node {i}");
+            }
         }
         for w in self.nodes.windows(2) {
             if w[0].layers[1] != w[1].layers[0] {
@@ -90,6 +120,11 @@ impl ChainConfig {
             if n.addr.is_none() {
                 bail!("remote node {i} needs an addr");
             }
+            n.addr
+                .as_ref()
+                .unwrap()
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("invalid address on node {i}"))?;
             if n.layers[0] >= n.layers[1] {
                 bail!("node {i} has an empty layer range");
             }
@@ -101,6 +136,24 @@ impl ChainConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_invalid_settings_before_loading_models() {
+        let valid: ChainConfig = toml::from_str(include_str!("../chain.example.toml")).unwrap();
+        valid.validate().unwrap();
+        for change in [0, 1, 2, 3, 4, 5, 6] {
+            let mut c = valid.clone();
+            match change {
+                0 => c.gamma = 0,
+                1 => c.gamma = usize::MAX,
+                2 => c.max_seq = 0,
+                3 => c.nodes[0].layers = [0, 0],
+                4 => c.nodes.last_mut().unwrap().layers[1] = 35,
+                5 => c.depth = 0,
+                _ => c.model = "Qwen/Qwen3-14B".into(),
+            }
+            assert!(c.validate().is_err(), "case {change}");
+        }
+    }
 
     #[test]
     fn parses_and_validates() {
