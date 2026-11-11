@@ -3,14 +3,12 @@
 //! The residual-stream hidden state crosses each shard boundary here, over a quinn bi-stream
 //! with length-prefixed msgpack framing ([`read_framed`]/[`write_framed`]).
 //!
-//! This module is the WIRE. [`crate::qwen::shard::ShardedChain`] does the in-process hand-off; a
-//! remote shard replaces that one `Vec<f32>` hop with [`PeerConnection::send`] of a
-//! [`HiddenStateFrame`]. The hidden round-trip is lossless (f32 bytes → msgpack bin → f32).
+//! This module is the WIRE: message types, framing and QUIC endpoints. [`crate::node`] is the
+//! protocol on top (handshake, serve loops, the head's pipelined link). The hidden round-trip is
+//! lossless (f32 bytes → msgpack bin → f32).
 //!
 //! NAT traversal / brokered path formation and the activation codec are later (see
 //! `docs/chain-formation-design.md`, `docs/pipeline-specdecode-design.md`).
-#![allow(dead_code)]
-
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,88 +68,91 @@ pub async fn read_framed<T: serde::de::DeserializeOwned>(
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// A residual-stream hidden state crossing a shard boundary: logically `[n_tokens, hidden]`.
-/// Bandwidth is small (~12 KiB/token at H=6144, bf16) — the wire is RTT-bound, not byte-bound —
-/// so the activation codec (`dtype`) is a second-order optimization for thin home uplinks, not
-/// the latency lever. The payload is the row-major hidden state in little-endian `dtype`.
+/// Wire protocol version. Bump on any incompatible change to the types below; nodes on
+/// different versions refuse each other at the handshake instead of mis-parsing frames.
+pub const PROTO_VERSION: u32 = 1;
+
+/// First message on every session, sent by the upstream node. The head describes the whole
+/// chain plan; each node checks its own seat against how it was started, so a mismatch (wrong
+/// model, layer range, chunk size, …) fails at connect with a readable error instead of
+/// producing garbage tokens or a missing-kernel panic mid-generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub proto: u32,
+    /// Shared secret; must equal the node's `--token` when it was started with one.
+    pub token: Option<String>,
+    /// Target model HF repo.
+    pub model: String,
+    /// Verify chunk size (gamma + 1): every hidden-state frame carries 1 or `chunk` tokens.
+    pub chunk: u32,
+    /// KV positions the chain will use; every node needs `--max-seq` at least this large.
+    pub max_seq: u32,
+    pub hidden_dim: u32,
+    /// Layer range `[start, end)` of every node in pipeline order; `plan[0]` is the head.
+    pub plan: Vec<[u32; 2]>,
+    /// The receiving node's seat in `plan` (>= 1).
+    pub index: u32,
+}
+
+/// What a remote node reports about itself in the handshake reply (logged by the head).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub layers: [u32; 2],
+    /// e.g. "cuda/Bf16", "metal/F32".
+    pub backend: String,
+    pub version: String,
+}
+
+/// A residual-stream hidden state crossing a shard boundary: logically `[n_tokens, hidden]`,
+/// row-major, little-endian `dtype`. Bandwidth is small (tens of KiB per chunk) — the wire is
+/// RTT-bound, not byte-bound — so the activation codec is a second-order optimization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HiddenStateFrame {
-    pub request_id: u64,
-    pub chain_id: u64,
-    /// Bumped on any chain re-plan; a node drops frames with a stale epoch (fencing).
-    pub epoch: u64,
+    /// Monotonic per-session frame counter; echoed in the matching [`VerifyResult`].
     pub step: u64,
-    /// Absolute sequence position of the first token in this chunk (the spec-decode `start_pos`);
-    /// every shard writes its KV at the same absolute positions, which makes rollback a no-op.
+    /// Absolute sequence position of the first token in this chunk; every shard writes its KV
+    /// at the same absolute positions, which makes speculative rollback a plain overwrite.
     pub start_pos: u32,
-    /// Which layer-block boundary this hidden state sits at (the cut index).
-    pub layer_boundary: u32,
     pub n_tokens: u32,
     pub hidden_dim: u32,
-    /// Activation codec on the wire, e.g. "f32" | "bf16" | "fp8".
+    /// Activation codec on the wire. Only "f32" exists today.
     pub dtype: String,
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
 impl HiddenStateFrame {
     /// Build an f32 hidden-state frame from a flat `[n_tokens * hidden_dim]` residual stream.
-    pub fn from_f32(
-        request_id: u64,
-        epoch: u64,
-        step: u64,
-        start_pos: u32,
-        layer_boundary: u32,
-        n_tokens: u32,
-        hidden_dim: u32,
-        hidden: &[f32],
-    ) -> Self {
-        Self {
-            request_id,
-            chain_id: 0,
-            epoch,
-            step,
-            start_pos,
-            layer_boundary,
-            n_tokens,
-            hidden_dim,
-            dtype: "f32".to_string(),
-            data: f32_to_le_bytes(hidden),
-        }
+    pub fn from_f32(step: u64, start_pos: u32, n_tokens: u32, hidden_dim: u32, hidden: &[f32]) -> Self {
+        Self { step, start_pos, n_tokens, hidden_dim, dtype: "f32".to_string(), data: f32_to_le_bytes(hidden) }
     }
 
-    /// Decode the payload back to a flat f32 residual stream (only `dtype == "f32"` for now).
+    /// Decode the payload back to a flat f32 residual stream (callers check `dtype == "f32"`).
     pub fn to_f32(&self) -> Vec<f32> {
-        debug_assert_eq!(self.dtype, "f32", "only the f32 codec is implemented");
         le_bytes_to_f32(&self.data)
     }
 }
 
-/// The tail returns this to node-0 (direct return, one hop) for spec-decode verification: the
-/// target's greedy argmax at each of the `gamma + 1` verify positions. (node-0 owns `lm_head` +
-/// the draft, so acceptance logits stay numerically consistent with the draft; for true sampling
-/// later this carries logprobs instead — see design docs.)
+/// The tail's answer to one [`HiddenStateFrame`]: the target's greedy argmax at each of its
+/// positions. (For true sampling later this carries logprobs instead — see design docs.)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerifyResult {
-    pub request_id: u64,
     pub step: u64,
     pub argmax: Vec<TokenId>,
-}
-
-/// Roll back every shard's KV to the committed prefix. With absolute-position KV writes this is
-/// advisory (the next chunk overwrites the rejected tail); maps to [`crate::engine::TargetChain::truncate`].
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct KvTruncate {
-    pub request_id: u64,
-    pub epoch: u64,
-    pub keep_to_pos: u32,
 }
 
 /// One framed message on a shard bi-stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PeerMessage {
+    /// Upstream → downstream, first message of a session.
+    Hello(Hello),
+    /// Downstream → upstream: this node and everything below it accepted the plan. Nodes are
+    /// listed in pipeline order starting with the replying node.
+    HelloAck(Vec<NodeInfo>),
     Hidden(HiddenStateFrame),
     Result(VerifyResult),
-    Truncate(KvTruncate),
+    /// Downstream → upstream: the session is over, and why. Relayed up to the head.
+    Error(String),
 }
 
 fn f32_to_le_bytes(xs: &[f32]) -> Vec<u8> {
@@ -201,6 +202,7 @@ impl PeerConnection {
     /// Close this side of the connection (call after the final frame is read). Dropping the
     /// connection sends an immediate CONNECTION_CLOSE that can discard un-read data, so the
     /// reader closes explicitly and the writer awaits [`wait_closed`] before tearing down.
+    #[cfg(test)]
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"bye");
     }
@@ -209,6 +211,11 @@ impl PeerConnection {
     /// does not drop (and truncate) before the reader has the frame.
     pub async fn wait_closed(&self) {
         self.conn.closed().await;
+    }
+
+    /// QUIC's current round-trip estimate to this peer.
+    pub fn rtt(&self) -> Duration {
+        self.conn.rtt()
     }
 
     /// Finish the send half cleanly (FIN). The peer's next `recv` returns `Ok(None)` (clean EOF)
@@ -290,7 +297,7 @@ pub async fn accept(ep: &Endpoint) -> io::Result<PeerConnection> {
 }
 
 fn io_other<E: ToString>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// TLS verifier that accepts any certificate (dev/test peer links; prod pins certs).
@@ -359,21 +366,17 @@ mod tests {
             let got = frame.to_f32();
             // Stand-in for the last shard's argmax: report what we received so the client can check.
             let argmax = vec![got.len() as TokenId, frame.n_tokens as TokenId, frame.start_pos as TokenId];
-            peer.send(&PeerMessage::Result(VerifyResult {
-                request_id: frame.request_id,
-                step: frame.step,
-                argmax,
-            }))
+            peer.send(&PeerMessage::Result(VerifyResult { step: frame.step, argmax }))
             .await?;
             peer.wait_closed().await; // hold the connection open until the client has the result
             io::Result::Ok(got)
         };
 
-        // Owner peer (node-0): dial, send the hidden state, read the result.
+        // Head: dial, send the hidden state, read the result.
         let client = dial_endpoint().unwrap();
         let client_fut = async {
             let mut peer = dial(&client, addr).await?;
-            let frame = HiddenStateFrame::from_f32(42, 1, 0, 7, 14, 4, 8, &hidden);
+            let frame = HiddenStateFrame::from_f32(42, 7, 4, 8, &hidden);
             peer.send(&PeerMessage::Hidden(frame)).await?;
             let result = match peer.recv().await?.expect("clean EOF before a result") {
                 PeerMessage::Result(r) => r,
@@ -387,7 +390,41 @@ mod tests {
         let server_got = server_got.expect("server side");
         let result = result.expect("client side");
         assert_eq!(server_got, hidden_expect, "hidden state must survive the QUIC round-trip exactly");
-        assert_eq!(result.request_id, 42);
+        assert_eq!(result.step, 42);
         assert_eq!(result.argmax, vec![32, 4, 7], "n_floats=32, n_tokens=4, start_pos=7");
+    }
+
+    /// The payload must travel as one msgpack `bin`, not an array of integers (which costs up
+    /// to 2 bytes per byte and is what a plain `Vec<u8>` serializes to).
+    #[test]
+    fn hidden_payload_is_compact_on_the_wire() {
+        let hidden = vec![-1.5f32; 8 * 2560]; // one gamma+1 chunk at Qwen3-4B width
+        let frame = PeerMessage::Hidden(HiddenStateFrame::from_f32(1, 0, 8, 2560, &hidden));
+        let bytes = rmp_serde::to_vec(&frame).unwrap();
+        let payload = hidden.len() * 4;
+        assert!(bytes.len() < payload + 64, "{} wire bytes for a {payload}-byte payload", bytes.len());
+        match rmp_serde::from_slice(&bytes).unwrap() {
+            PeerMessage::Hidden(f) => assert_eq!(f.to_f32(), hidden),
+            other => panic!("expected Hidden, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_messages_roundtrip() {
+        let hello = Hello {
+            proto: PROTO_VERSION,
+            token: Some("s3cret".into()),
+            model: "Qwen/Qwen3-4B".into(),
+            chunk: 8,
+            max_seq: 768,
+            hidden_dim: 2560,
+            plan: vec![[0, 18], [18, 36]],
+            index: 1,
+        };
+        let bytes = rmp_serde::to_vec(&PeerMessage::Hello(hello.clone())).unwrap();
+        match rmp_serde::from_slice(&bytes).unwrap() {
+            PeerMessage::Hello(h) => assert_eq!(h, hello),
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 }

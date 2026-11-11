@@ -17,17 +17,14 @@ use luminal::prelude::*;
 use super::model::{KVCache, Qwen, QwenConfig};
 use crate::engine::{TargetChain, TokenId};
 
-const EOS_TOKEN: i32 = 151645; // <|im_end|>
-const STOP_TOKEN: i32 = 151643; // <|endoftext|>
-
 /// Runtime abstraction over the Luminal backends (mirrors the qwen example's trait).
 pub trait QwenRuntime: Runtime<ExecReturn = ()> {
     type Buffer;
     fn load_safetensors(&mut self, cx: &Graph, file_path: &str);
     fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>);
-    /// Feed F32 data into an input tensor; if the tensor is F16 the runtime converts (used to
-    /// inject a residual-stream hidden state into a non-first pipeline shard, losslessly since
-    /// the data originated as F16 from `get_f32`).
+    /// Feed raw f32 data into an **F32-typed** input tensor (the residual stream entering a
+    /// non-first shard). Backends differ on whether they convert by tensor dtype, so the graph
+    /// keeps every host-boundary tensor F32 and casts internally.
     fn set_f32_data(&mut self, id: NodeIndex, data: Vec<f32>);
     fn set_zeros(&mut self, id: NodeIndex, num_bytes: usize);
     fn remove_buffer(&mut self, id: NodeIndex) -> Self::Buffer;
@@ -88,17 +85,7 @@ impl QwenRuntime for luminal_cuda_lite::runtime::CudaRuntime {
     }
 }
 
-pub(crate) fn argmax(row: &[f32]) -> TokenId {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in row.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as TokenId
-}
+pub(crate) use crate::engine::argmax;
 
 pub struct QwenTarget<R: QwenRuntime> {
     cx: Graph,
@@ -115,6 +102,7 @@ pub struct QwenTarget<R: QwenRuntime> {
 impl<R: QwenRuntime + 'static> QwenTarget<R> {
     /// Build the graph, run the egglog search, and load the bf16 weights. `weights_path` is
     /// the combined safetensors produced by `super::hf::prepare_hf_model`.
+    #[cfg_attr(not(test), allow(dead_code))] // tests + diagnostics only
     pub fn load(
         runtime: R,
         cfg: QwenConfig,
@@ -217,6 +205,7 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
     }
 
     /// Zero the per-layer KV cache (e.g. between two independent generations).
+    #[cfg_attr(not(test), allow(dead_code))] // tests + diagnostics only
     pub fn reset(&mut self) {
         let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..self.cfg.layers {
@@ -251,7 +240,7 @@ impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
     }
 
     fn is_eos(&self, token: TokenId) -> bool {
-        token == EOS_TOKEN || token == STOP_TOKEN
+        super::is_eos(token)
     }
 }
 
@@ -302,13 +291,13 @@ mod tests {
         out
     }
 
-    // cargo test -p dria-node --features metal qwen_target_spec_decode -- --ignored --nocapture
+    // cargo test --release --features metal qwen_target_spec_decode -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_target_spec_decode() {
         let model_dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B")
             .expect("download/prepare Qwen3-0.6B");
-        let weights = model_dir.join("model_combined_bf16_v1.safetensors");
+        let weights = model_dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
         let rt = luminal_metal::MetalRuntime::initialize(());
         let mut target = QwenTarget::load(rt, QwenConfig::QWEN3_0_6B, weights.to_str().unwrap(), 512, 200);
 
@@ -363,15 +352,15 @@ mod tests {
 
     // THE REAL ACCEPTANCE NUMBER: Qwen3-0.6B drafts Qwen3-4B, greedy, on Luminal/Metal.
     // toks/traversal = E[accepted]+1 is the speedup proxy the throughput thesis hinges on.
-    // cargo test -p dria-node --features metal qwen_real_g_4b -- --ignored --nocapture
+    // cargo test --release --features metal qwen_real_g_4b -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_real_g_4b() {
         let dir4b = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-4B").expect("prepare 4B");
         let dir06b =
             crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let w4b = dir4b.join("model_combined_bf16_v1.safetensors");
-        let w06b = dir06b.join("model_combined_bf16_v1.safetensors");
+        let w4b = dir4b.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
+        let w06b = dir06b.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
 
         let mut target = QwenTarget::load(
             luminal_metal::MetalRuntime::initialize(()),
@@ -423,13 +412,13 @@ mod tests {
     // model the MLP/projections dominate and are CONSTANT per token; attention is sub-dominant, so
     // ms/step should be nearly flat. If it grows steeply with context, the model forward itself is
     // the culprit (re-prefill? naive O(context) attention/GQA kernel?), not the pipeline.
-    // cargo test -p dria-node --features metal qwen_forward_scaling -- --ignored --nocapture
+    // cargo test --release --features metal qwen_forward_scaling -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_forward_scaling() {
         use std::time::Instant;
         let dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("0.6B");
-        let weights = dir.join("model_combined_bf16_v1.safetensors");
+        let weights = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
         let rt = luminal_metal::MetalRuntime::initialize(());
         let mut target =
             QwenTarget::load(rt, QwenConfig::QWEN3_0_6B, weights.to_str().unwrap(), 768, 200);
@@ -457,14 +446,14 @@ mod tests {
     // DIAGNOSTIC: forward time vs CHUNK SIZE s (tokens fed at once) at fixed context, single-
     // process. Spec-decode uses s=γ+1 (multi-token); single-token decode uses s=1. If s≥2 is far
     // slower than s=1, the multi-token kernel (dim bucket [2,max_seq], generic) is the bottleneck
-    // vs the specialized [1,1] kernel. cargo test -p dria-node --features metal
+    // vs the specialized [1,1] kernel. cargo test --release --features metal
     // qwen_forward_vs_chunk_size -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_forward_vs_chunk_size() {
         use std::time::Instant;
         let dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("0.6B");
-        let weights = dir.join("model_combined_bf16_v1.safetensors");
+        let weights = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
         let rt = luminal_metal::MetalRuntime::initialize(());
         let mut target =
             QwenTarget::load(rt, QwenConfig::QWEN3_0_6B, weights.to_str().unwrap(), 768, 200);

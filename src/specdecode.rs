@@ -1,19 +1,14 @@
-//! Greedy speculative-decode driver — the orchestration core of the GLM-5.2 pipeline.
+//! Greedy speculative-decode driver — the synchronous reference (one chunk in flight).
 //!
-//! Substrate-agnostic: it drives a [`DraftEngine`] (node-0 local) against a
-//! [`TargetChain`] (the sharded target) over the traits in [`crate::engine`], so the
-//! accept/reject + KV-rollback logic here is identical whether the chain is Luminal on
-//! CUDA, a synthetic test, or a single process. Each round:
+//! Substrate-agnostic: it drives a [`DraftEngine`] (local to the head) against a
+//! [`TargetChain`] over the traits in [`crate::engine`]. Each round:
 //!   1. draft `gamma` tokens locally,
 //!   2. verify `[cur] + drafts` in one chain traversal,
 //!   3. accept the longest prefix matching the target's greedy argmax, take the correction,
-//!   4. roll back the speculative KV tail (`KvTruncate`).
+//!   4. roll back the speculative KV tail.
 //!
-//! Output is **bit-identical to plain greedy decode of the target** (greedy token-id
-//! equality), regardless of draft quality — the losslessness property validated in M1
-//! (`src/inference/engine.rs::test_spec_decode_characterization_qwen`) where the substrate
-//! is deterministic. This is the same loop, lifted off llama.cpp and onto the trait
-//! boundary so it serves the Luminal pipeline.
+//! Output equals plain greedy decode of the target regardless of draft quality. The CLI uses
+//! the pipelined driver ([`crate::specpipe`]), which is tested against this one.
 
 use crate::engine::{DraftEngine, TargetChain, TokenId};
 
@@ -62,7 +57,7 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
             break;
         }
 
-        // Draft gamma tokens continuing [prompt ++ out ++ cur] (all local to node-0).
+        // Draft gamma tokens continuing [prompt ++ out ++ cur] (all local to the head).
         let mut context = Vec::with_capacity(prompt.len() + out.len() + 1);
         context.extend_from_slice(prompt);
         context.extend_from_slice(&out);

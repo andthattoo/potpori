@@ -1,20 +1,33 @@
-//! Substrate-agnostic engine traits for pipeline-parallel GLM-5.2 serving.
+//! Substrate-agnostic engine traits.
 //!
-//! The whole point of these traits is that the speculative-decode **driver**
-//! ([`crate::specdecode`]) is written purely against them — so its accept/reject +
-//! KV-rollback logic is unit-testable with synthetic engines, with zero dependency on
-//! Luminal, a GPU, or a real model. The production implementations are:
-//!   - [`DraftEngine`]  → a small Luminal model on node-0 (e.g. GLM-4-9B), off the WAN.
-//!   - [`TargetChain`]  → the GLM-5.2 layers sharded across the node chain, fanned out
-//!                        over QUIC; to the driver it is just a black box that verifies a
-//!                        chunk and can truncate its (per-shard) KV.
+//! The speculative-decode **drivers** ([`crate::specdecode`], [`crate::specpipe`]) are written
+//! purely against these traits — so their accept/reject logic is unit-testable with synthetic
+//! engines, with zero dependency on Luminal, a GPU, or a real model. The production
+//! implementations are:
+//!   - [`DraftEngine`] → a small model on the head ([`crate::qwen::draft::IncrementalDraft`]).
+//!   - the sharded target → [`crate::node::ChainLink`] (the head's shard + the remote chain
+//!     over QUIC), driven through [`crate::specpipe::PipelinedChain`].
 //!
 //! See `docs/pipeline-specdecode-design.md` and `docs/substrate-decision.md`.
 
 /// A vocabulary token id. Matches llama/Luminal/HF conventions (i32).
 pub type TokenId = i32;
 
-/// The local draft model. Runs entirely on node-0 (the path owner), off the WAN, and
+/// Greedy pick over one row of logits. NaN never wins (an all-NaN row yields token 0, which
+/// the head's draft sanity check treats as the "miscompiled kernel" signal).
+pub fn argmax(row: &[f32]) -> TokenId {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as TokenId
+}
+
+/// The local draft model. Runs entirely on the head, off the WAN, and
 /// proposes the next `gamma` tokens greedily given the committed context.
 pub trait DraftEngine {
     /// Greedily draft `gamma` tokens continuing `context` (the committed token ids,
@@ -22,12 +35,10 @@ pub trait DraftEngine {
     fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId>;
 }
 
-/// The sharded target model (GLM-5.2), exposed to the driver as a black box.
-///
-/// In production a single call here fans the hidden state out across the shard chain over
-/// QUIC and reads the result back; here it is a trait so the driver stays substrate- and
-/// transport-agnostic.
-#[allow(dead_code)] // truncate/is_eos are driver-facing; the CLI path only uses the pipelined driver
+/// A target model exposed to the synchronous reference driver as a black box (one chunk in
+/// flight). The CLI path uses the pipelined [`crate::specpipe::PipelinedChain`] instead; this
+/// stays as the simple correctness reference the pipelined driver is tested against.
+#[allow(dead_code)] // reference driver: consumed by tests + single-process diagnostics
 pub trait TargetChain {
     /// Prefill `prompt` into the chain's (per-shard) KV — leaving each shard's cache
     /// holding positions `[0, prompt.len())` — and return the target's greedy argmax for

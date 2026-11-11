@@ -13,6 +13,8 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::transport::{Hello, PROTO_VERSION};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChainConfig {
     /// Target model HF repo, e.g. "Qwen/Qwen3-4B".
@@ -32,6 +34,10 @@ pub struct ChainConfig {
     /// Egglog search budget per shard load (higher = better kernels, slower startup).
     #[serde(default = "default_search_graphs")]
     pub search_graphs: usize,
+    /// Shared secret presented to every remote node (they check it against their `--token`).
+    /// The `POTPORI_TOKEN` environment variable overrides this, to keep it out of the file.
+    #[serde(default)]
+    pub token: Option<String>,
     /// Pipeline order: nodes[0] = head (local), nodes[1..] remote, last = tail.
     pub nodes: Vec<ChainNode>,
 }
@@ -96,6 +102,21 @@ impl ChainConfig {
     /// The verify chunk size every shard must be compiled for (`potpori serve --chunk`).
     pub fn chunk(&self) -> usize {
         self.gamma + 1
+    }
+
+    /// The handshake the head opens every session with: the whole plan, addressed to the
+    /// first remote node (each node forwards it with the next seat number).
+    pub fn hello(&self, hidden_dim: usize, token: Option<String>) -> Hello {
+        Hello {
+            proto: PROTO_VERSION,
+            token,
+            model: self.model.clone(),
+            chunk: self.chunk() as u32,
+            max_seq: self.max_seq as u32,
+            hidden_dim: hidden_dim as u32,
+            plan: self.nodes.iter().map(|n| [n.layers[0] as u32, n.layers[1] as u32]).collect(),
+            index: 1,
+        }
     }
 
     /// Check the plan against the target model's layer count (known only once the model is
@@ -189,6 +210,9 @@ mod tests {
         assert_eq!(cfg.remote_addr(2).unwrap(), "100.64.0.3:4010".parse().unwrap());
         cfg.check_layers(36).unwrap();
         assert!(cfg.check_layers(28).is_err());
+        let hello = cfg.hello(2560, Some("t".into()));
+        assert_eq!(hello.plan, vec![[0, 12], [12, 24], [24, 36]]);
+        assert_eq!((hello.chunk, hello.max_seq, hello.index), (8, 768, 1));
     }
 
     fn two_node(extra: &str, head: &str, tail_addr: &str, tail: &str) -> Result<ChainConfig> {

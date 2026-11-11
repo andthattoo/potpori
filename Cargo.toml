@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+serde_bytes = "0.11"
 toml = "0.8"
 anyhow = "1"
 tracing = "0.1"

@@ -3,24 +3,22 @@
 //! A [`Shard`] runs a contiguous global layer range on its own Luminal graph + KV cache. The
 //! first shard embeds token-ids; non-first shards take a residual stream as input. The last
 //! shard applies the final norm + tied lm_head and emits logits; non-last shards emit the
-//! residual stream (`[seq, hidden]` F16) to hand to the next shard. [`ShardedChain`] wires N
-//! shards in sequence and implements [`TargetChain`], so `run_spec_decode` drives a sharded
-//! model unchanged.
+//! residual stream (`[seq, hidden]`) to hand to the next shard.
 //!
-//! Hidden state is handed shard→shard IN-PROCESS here (as a `Vec<f32>`); the QUIC transport
-//! (`transport.rs`) replaces that one hop with a wire send. The round-trip is lossless: the F16
-//! boundary tensor → `get_f32` (F16→F32 exact) → `set_f32_data` (F32→F16 exact, since the data
-//! originated as F16). This is the "free cut" the substrate decision rests on, on a real model.
-#![allow(dead_code)] // Shard/ShardedChain are consumed by the cut test + (next) the QUIC transport.
+//! The residual stream crosses the host boundary as F32 (cast in-graph from/to the main dtype),
+//! which is exact in both directions — the "free cut" the substrate decision rests on. A
+//! [`Shard`] implements [`ShardEngine`], so [`crate::node`] can serve it or use it as the head.
 
 use luminal::prelude::*;
 
 use super::model::{KVCache, QwenConfig, QwenShard};
-use super::target::{argmax, QwenRuntime};
-use crate::engine::{TargetChain, TokenId};
-
-const EOS_TOKEN: i32 = 151645; // <|im_end|>
-const STOP_TOKEN: i32 = 151643; // <|endoftext|>
+use super::target::QwenRuntime;
+#[cfg(test)]
+use super::target::argmax;
+use crate::engine::TokenId;
+#[cfg(test)]
+use crate::engine::TargetChain;
+use crate::node::ShardEngine;
 
 /// What a shard consumes: token-ids (first shard) or a residual stream (non-first shard).
 enum ShardInput {
@@ -32,13 +30,14 @@ enum ShardInput {
 pub struct Shard<R: QwenRuntime> {
     cx: Graph,
     runtime: R,
-    input: GraphTensor,   // Int token-ids ([s]) if first, else F16 hidden ([s, hidden])
+    input: GraphTensor,   // Int token-ids ([s]) if first, else F32 hidden ([s, hidden])
     pos_ids: GraphTensor, // absolute positions
-    out: GraphTensor,     // F32 logits ([s, vocab]) if last, else F16 hidden ([s, hidden])
+    out: GraphTensor,     // F32 logits ([s, vocab]) if last, else F32 hidden ([s, hidden])
     kv_cache: KVCache,
     cache_outputs: Vec<(GraphTensor, GraphTensor)>,
     cfg: QwenConfig,
     is_first: bool,
+    #[cfg_attr(not(test), allow(dead_code))] // tests + diagnostics only
     is_last: bool,
     n_layers: usize,
     max_seq_len: usize,
@@ -50,6 +49,7 @@ impl<R: QwenRuntime + 'static> Shard<R> {
     /// Build this shard's graph with the GENERIC `s` bucket (`[2,max]` — slow multi-token kernel;
     /// see [`load_chunked`](Self::load_chunked) for the fast specialized path).
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))] // tests + diagnostics only
     pub fn load(
         runtime: R,
         cfg: QwenConfig,
@@ -86,7 +86,8 @@ impl<R: QwenRuntime + 'static> Shard<R> {
         let input = if is_first {
             cx.named_tensor("input", 's').as_dtype(DType::Int)
         } else {
-            cx.named_tensor("input", ('s', cfg.hidden)).as_dtype(super::model::main_dtype())
+            // F32 at the host boundary on every backend (see `QwenShard::forward`).
+            cx.named_tensor("input", ('s', cfg.hidden)).as_dtype(DType::F32)
         };
         let pos_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
         let kv_cache = KVCache::new(&mut cx, &cfg, max_seq_len, n_layers);
@@ -154,31 +155,6 @@ impl<R: QwenRuntime + 'static> Shard<R> {
         }
     }
 
-    /// Whether a chunk of `s` positions starting at absolute `start_pos` can run on this shard:
-    /// a compiled kernel bucket exists for `s`, and every position fits in the KV cache. Past
-    /// `max_seq` the KV scatter would write out of range on the GPU, so serve loops check this
-    /// on every (untrusted) inbound frame.
-    pub fn check_chunk(&self, start_pos: u32, s: usize) -> Result<(), String> {
-        if s == 0 {
-            return Err("empty chunk (0 tokens)".into());
-        }
-        if self.chunk_size > 0 && s != 1 && s != self.chunk_size {
-            return Err(format!(
-                "no kernel for a {s}-token chunk: this shard was compiled for 1 or {} tokens \
-                 (--chunk must equal the chain's gamma+1 on every node)",
-                self.chunk_size
-            ));
-        }
-        let end = start_pos as usize + s;
-        if end > self.max_seq_len {
-            return Err(format!(
-                "chunk [{start_pos}, {end}) exceeds this shard's max_seq {}",
-                self.max_seq_len
-            ));
-        }
-        Ok(())
-    }
-
     /// Run `s` positions starting at absolute `start_pos`; advance the KV; return the output
     /// (`[s, vocab]` logits if last shard, else `[s, hidden]` residual stream) flattened.
     fn run_chunk(&mut self, start_pos: u32, s: usize, input: ShardInput) -> Vec<f32> {
@@ -207,51 +183,69 @@ impl<R: QwenRuntime + 'static> Shard<R> {
         out_data
     }
 
-    pub fn reset(&mut self) {
+}
+
+impl<R: QwenRuntime + 'static> ShardEngine for Shard<R> {
+    fn hidden_dim(&self) -> usize {
+        self.cfg.hidden
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+
+    /// A compiled kernel bucket must exist for `s`, and every position must fit in the KV
+    /// cache: past `max_seq` the KV scatter would write out of range on the GPU.
+    fn check_chunk(&self, start_pos: u32, s: usize) -> Result<(), String> {
+        if s == 0 {
+            return Err("empty chunk (0 tokens)".into());
+        }
+        if self.chunk_size > 0 && s != 1 && s != self.chunk_size {
+            return Err(format!(
+                "no kernel for a {s}-token chunk: this shard was compiled for 1 or {} tokens \
+                 (--chunk must equal the chain's gamma+1 on every node)",
+                self.chunk_size
+            ));
+        }
+        let end = start_pos as usize + s;
+        if end > self.max_seq_len {
+            return Err(format!(
+                "chunk [{start_pos}, {end}) exceeds this shard's max_seq {}",
+                self.max_seq_len
+            ));
+        }
+        Ok(())
+    }
+
+    fn forward_tokens(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<f32> {
+        assert!(self.is_first, "only the first shard embeds tokens");
+        self.run_chunk(start_pos, tokens.len(), ShardInput::Tokens(tokens.to_vec()))
+    }
+
+    fn forward_hidden(&mut self, start_pos: u32, s: usize, hidden: Vec<f32>) -> Vec<f32> {
+        assert!(!self.is_first, "the first shard takes tokens, not a residual stream");
+        self.run_chunk(start_pos, s, ShardInput::Hidden(hidden))
+    }
+
+    fn reset(&mut self) {
         let cache_bytes = self.cfg.n_kv_heads * self.max_seq_len * self.cfg.head_dim * (super::model::main_dtype().bits() / 8);
         for i in 0..self.n_layers {
             self.runtime.set_zeros(self.kv_cache.k_caches[i].id, cache_bytes);
             self.runtime.set_zeros(self.kv_cache.v_caches[i].id, cache_bytes);
         }
     }
-
-    /// First shard: embed `tokens` (absolute positions from `start_pos`), run the shard, return
-    /// the residual stream `[s, hidden]` flat.
-    pub fn forward_tokens(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<f32> {
-        self.run_chunk(start_pos, tokens.len(), ShardInput::Tokens(tokens.to_vec()))
-    }
-
-    /// Non-first shard: consume a residual stream (`s` positions from `start_pos`), run the shard,
-    /// return the residual stream (or logits `[s, vocab]` if this is the last shard) flat.
-    pub fn forward_hidden(&mut self, start_pos: u32, s: usize, hidden: Vec<f32>) -> Vec<f32> {
-        self.run_chunk(start_pos, s, ShardInput::Hidden(hidden))
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.cfg.vocab_size
-    }
-
-    pub fn hidden_dim(&self) -> usize {
-        self.cfg.hidden
-    }
-
-    pub fn max_seq(&self) -> usize {
-        self.max_seq_len
-    }
-
-    pub fn is_last(&self) -> bool {
-        self.is_last
-    }
 }
 
 /// A node chain: shards run in sequence, each consuming the previous shard's output. Implements
 /// [`TargetChain`] so the spec-decode driver drives the sharded model unchanged. In-process
 /// hidden-state hand-off (the QUIC transport replaces the shard→shard hop).
+#[cfg(test)]
 pub struct ShardedChain<R: QwenRuntime> {
     shards: Vec<Shard<R>>,
     vocab_size: usize,
 }
 
+#[cfg(test)]
 impl<R: QwenRuntime + 'static> ShardedChain<R> {
     pub fn new(shards: Vec<Shard<R>>) -> Self {
         assert!(!shards.is_empty(), "a chain needs at least one shard");
@@ -287,6 +281,7 @@ impl<R: QwenRuntime + 'static> ShardedChain<R> {
     }
 }
 
+#[cfg(test)]
 impl<R: QwenRuntime + 'static> TargetChain for ShardedChain<R> {
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
         let logits = self.run(0, prompt);
@@ -309,7 +304,7 @@ impl<R: QwenRuntime + 'static> TargetChain for ShardedChain<R> {
     }
 
     fn is_eos(&self, token: TokenId) -> bool {
-        token == EOS_TOKEN || token == STOP_TOKEN
+        super::is_eos(token)
     }
 }
 
@@ -333,13 +328,13 @@ mod tests {
 
     // THE CUT, on the real model: a 2-shard pipeline (hidden state round-tripped at the layer
     // boundary) must reproduce the single-process forward bit-for-bit.
-    // cargo test -p dria-node --features metal qwen_cut_2shard -- --ignored --nocapture
+    // cargo test --release --features metal qwen_cut_2shard -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_cut_2shard() {
         let cfg = QwenConfig::QWEN3_0_6B;
         let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let w = dir.join("model_combined_bf16_v1.safetensors");
+        let w = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
         let wp = w.to_str().unwrap();
 
         // Single-process baseline.

@@ -189,9 +189,16 @@ impl QwenShard {
         Self { cfg, is_first, is_last, embedding, layers, lm_norm }
     }
 
-    /// `input` is token-ids (`[s]`, Int — first shard) or a residual stream (`[s, hidden]`, F16 —
-    /// non-first). Returns logits (`[s, vocab]`, F32 — last shard) or the residual stream
-    /// (`[s, hidden]`, F16 — non-last).
+    /// `input` is token-ids (`[s]`, Int — first shard) or a residual stream (`[s, hidden]` —
+    /// non-first). Returns logits (`[s, vocab]` — last shard) or the residual stream
+    /// (`[s, hidden]` — non-last).
+    ///
+    /// Everything that crosses the host boundary is **F32 in the graph**, cast to/from the
+    /// main dtype here. The host side moves raw f32 bytes (`set_f32_data` / `get_f32`), and
+    /// only Metal's runtime converts by tensor dtype — CUDA's copies bytes verbatim, so a
+    /// Bf16-typed boundary tensor there would be fed f32 bytes as bf16 (and read back at half
+    /// length). The casts are exact: bf16/f16 → f32 always, and f32 → bf16/f16 because the
+    /// values originated in that dtype on the upstream shard.
     pub fn forward(
         &self,
         input: GraphTensor,
@@ -200,6 +207,8 @@ impl QwenShard {
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         let mut x = if self.is_first {
             token_embedding(self.embedding.unwrap(), input, &self.cfg)
+        } else if input.dtype != main_dtype() {
+            input.cast(main_dtype())
         } else {
             input
         };
@@ -218,12 +227,9 @@ impl QwenShard {
             }
             (logits, cache_outputs)
         } else {
-            (x, cache_outputs)
+            let out = if x.dtype != DType::F32 { x.cast(DType::F32) } else { x };
+            (out, cache_outputs)
         }
-    }
-
-    pub fn num_layers(&self) -> usize {
-        self.layers.len()
     }
 }
 

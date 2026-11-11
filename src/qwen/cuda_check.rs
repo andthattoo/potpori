@@ -38,7 +38,7 @@ fn verify_ms(t: &mut QwenTarget<CudaRuntime>, pos: u32, cur: TokenId, drafts: &[
 #[ignore]
 fn cuda_substrate_check() {
     let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("download/prepare Qwen3-0.6B");
-    let weights = dir.join("model_combined_bf16_v1.safetensors");
+    let weights = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
     // (1) Build + run: if we get past load(), Luminal CUDA + NVRTC works.
     let rt = CudaRuntime::new().expect("init CUDA runtime (toolkit + driver present?)");
     let mut t = QwenTarget::load(rt, QwenConfig::QWEN3_0_6B, weights.to_str().unwrap(), 768, 200);

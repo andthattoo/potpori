@@ -1,8 +1,9 @@
 //! Qwen3 on Luminal — the bring-up model family for the sharded spec-decode pipeline (0.6B
 //! draft / 1.7B / 4B targets; the GLM-5.2 port follows the same shape with its own config).
 //! `model` is the layer-loop forward + `QwenShard` (the pipeline cut); `hf` downloads/prepares
-//! weights; `target`/`shard`/`distributed` drive it locally, in-process-sharded, and over QUIC.
-#![allow(dead_code)]
+//! weights; `target` runs a whole model in one process (the draft, and the single-process
+//! baseline in tests); `shard` runs one layer block and plugs into the chain protocol in
+//! [`crate::node`].
 
 pub mod hf;
 pub mod model;
@@ -11,7 +12,9 @@ pub mod target;
 
 pub mod shard;
 
-pub mod distributed;
+// Real-model chain tests (Metal, `--ignored`): the protocol in `crate::node` over actual shards.
+#[cfg(all(test, feature = "metal", target_vendor = "apple"))]
+mod chain_tests;
 
 pub mod draft;
 pub mod tok;
@@ -21,6 +24,15 @@ pub mod tok;
 mod cuda_check;
 
 use model::QwenConfig;
+
+use crate::engine::TokenId;
+
+/// Tokens that end a Qwen3 generation: `<|im_end|>` and `<|endoftext|>`.
+pub const EOS_TOKENS: [TokenId; 2] = [151645, 151643];
+
+pub fn is_eos(token: TokenId) -> bool {
+    EOS_TOKENS.contains(&token)
+}
 
 /// The HF repos this build has a model config for.
 pub const KNOWN_MODELS: [&str; 3] = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"];
