@@ -18,6 +18,7 @@ gamma = 7                         # draft length per round; verify chunk = gamma
 max_seq = 768                     # KV size on every shard (768 = default + validated point);
                                   # must hold prompt + max_new + depth*gamma positions
 depth = 4                         # in-flight verify chunks (pipelining; hides WAN RTT)
+# token = "shared-secret"         # must match each node's --token (or set POTPORI_TOKEN)
 
 [[nodes]]          # head — this machine (potpori chat)
 layers = [0, 12]

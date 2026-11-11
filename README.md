@@ -32,15 +32,19 @@ Python, no Docker.
 
 ## Status
 
-Early. What's here today, all verified lossless (bit-identical to single-process greedy) in the
-test suite:
+Early. What's here today (the real-model checks are `--ignored` tests that need a GPU;
+"lossless" means token-identical to greedy decode of the same chain — different kernels can
+still pick differently at numerical near-ties):
 
 - ✅ sync + depth-N pipelined spec-decode drivers (GPU-free unit tests)
+- ✅ the chain protocol — handshake, error propagation, pipelined head link — tested over real
+  QUIC with a synthetic shard (`cargo test`, no GPU)
 - ✅ 2-node and 3-node (head → middle → tail) chains over real QUIC — Qwen3-0.6B, Metal
 - ✅ real acceptance measured: Qwen3-0.6B drafting Qwen3-4B → 2.67 tok/traversal
 - ✅ Metal multi-token kernel cliff found + worked around (chunk-specialized kernels, ~20×)
 - ✅ CUDA substrate validated (A6000): builds, correct, **no** kernel cliff there
 - 🚧 `serve`/`chat` CLI (this repo's M0 — wiring the above into a usable tool)
+- 🚧 first real two-machine run, Metal ↔ CUDA — see [`docs/wan-test.md`](docs/wan-test.md)
 - 🔜 GLM-5.2 (744B, NVFP4) as the flagship target — the whole point; needs the big-GPU chain
 - 🔜 NAT traversal, reconnection, activation codecs, sampling (temperature) story
 
@@ -72,6 +76,13 @@ Then chat from the head:
 potpori chat --chain chain.toml --prompt "explain speculative decoding in one paragraph"
 ```
 
+Every session starts with a handshake: the head sends the whole plan and each node checks its
+own seat (model, layers, `--chunk`, `--max-seq`, version), so a misconfigured chain fails at
+connect, naming the node and the reason. To keep strangers off a shard, start it with
+`--token <secret>` (or `POTPORI_TOKEN`) and put the same `token` in the chain config; without
+one, anyone who can reach the port can use it — fine on a private network like Tailscale.
+The link is encrypted but nodes do not verify each other's certificates yet.
+
 First runs are slow to start: weights download once, and Luminal's kernel search compiles each
 shard (~minutes). Generation itself is the fast part.
 
@@ -88,8 +99,10 @@ The `docs/` folder carries the full design + findings history: the pipeline/spec
 chain formation, the substrate decision (why Luminal), and the CUDA runbook. Notable findings
 baked into the code:
 
-- Metal has no bf16 load path at the pinned Luminal rev → weights run F16 on Metal, Bf16 on CUDA
-  (`MAIN_DTYPE`).
+- Metal has no bf16 load path at the pinned Luminal rev and F16 overflows on real prompts →
+  the main path runs F32 on Metal, Bf16 on CUDA (`main_dtype`, `POTPORI_DTYPE`).
+- The residual stream is F32 at every shard boundary (cast in-graph): CUDA's runtime moves raw
+  bytes while Metal's converts by dtype, so a 16-bit boundary tensor only worked on Metal.
 - Luminal/Metal's generic dynamic-length forward kernel is ~20× slower than a fixed-size one →
   shards compile **point buckets** for `s ∈ {1, γ+1}` (`Shard::load_chunked`). CUDA doesn't
   need this (measured: no cliff).
