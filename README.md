@@ -148,6 +148,8 @@ way. Metal execution has not been validated since the Luminal migration; see
 | `src/node.rs` | The head, middle and tail roles, generic over a shard. |
 | `src/specpipe.rs`, `src/specdecode.rs` | The pipelined driver and the one-chunk-at-a-time reference driver. |
 | `src/qwen/` | Qwen3 on Luminal: graph, CUDA/Metal runtimes, weights, tokenizer, shard, draft. |
+| `docs/dspark.md` | DSpark drafters for Qwen3: how they work, what they would change here, how to compare them with the small-model draft. |
+| `tools/compare_drafts.py` | Measures both kinds of draft on one GPU (PyTorch). |
 | `docs/luminal-migration.md` | What changed with the current Luminal revision, and what has been validated. |
 | `docs/history/` | Earlier design notes, kept for the reasoning. |
 
