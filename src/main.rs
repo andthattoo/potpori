@@ -38,6 +38,11 @@ mod specdecode;
     not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
     allow(dead_code)
 )]
+mod specfeat;
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod specpipe;
 #[cfg_attr(
     not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),

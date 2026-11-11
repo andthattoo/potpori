@@ -95,6 +95,7 @@ impl<R: QwenRuntime + 'static> ShardEngine for Shard<R> {
             next_layer,
             max_seq: self.capacity(),
             chunk: self.chunk_size(),
+            taps: Vec::new(),
         }
     }
     fn range(&self) -> (usize, usize) {

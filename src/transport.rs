@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::TokenId;
 
 /// Bumped on every incompatible wire change, so mismatched builds fail at the TLS handshake.
-const ALPN: &[u8] = b"potpori-shard-v3";
+const ALPN: &[u8] = b"potpori-shard-v4";
 
 // ---------------------------------------------------------------------------
 // Length-prefixed msgpack framing
@@ -145,16 +145,60 @@ impl HiddenStateFrame {
     }
 }
 
+/// The output of one tapped layer for every position of a chunk: `[n_tokens, hidden]`,
+/// row-major, as little-endian bf16. A feature-conditioned draft model (DSpark) reads these.
+/// bf16 keeps f32's range at half the bytes; the precision only affects draft quality.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayerTap {
+    /// Zero-based layer whose output this is.
+    pub layer: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+impl LayerTap {
+    pub fn from_f32(layer: usize, values: &[f32]) -> Self {
+        let mut data = Vec::with_capacity(values.len() * 2);
+        for &x in values {
+            data.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+        }
+        Self {
+            layer: layer as u32,
+            data,
+        }
+    }
+
+    pub fn to_f32(&self) -> Vec<f32> {
+        self.data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+            .collect()
+    }
+}
+
 /// The tail's answer to one [`HiddenStateFrame`]: the target's greedy token at each of its
-/// positions. Middles relay it upstream to the head, which does the acceptance check.
+/// positions. Middles relay it upstream to the head, which does the acceptance check. When
+/// the session taps layers, every remote node adds its tapped outputs on the way up.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerifyResult {
     pub step: u64,
     pub argmax: Vec<TokenId>,
+    pub taps: Vec<LayerTap>,
 }
 
 impl VerifyResult {
-    pub fn validate(&self, step: u64, count: usize, vocab: usize) -> io::Result<()> {
+    /// Check a result against the frame it answers: `count` tokens below `vocab`, and exactly
+    /// the tapped `layers` (ascending), each `[count, hidden]` and finite.
+    pub fn validate(
+        &self,
+        step: u64,
+        count: usize,
+        vocab: usize,
+        layers: &[usize],
+        hidden: usize,
+    ) -> io::Result<()> {
         if self.step != step
             || self.argmax.len() != count
             || self.argmax.iter().any(|&t| t < 0 || t as usize >= vocab)
@@ -162,6 +206,18 @@ impl VerifyResult {
             return Err(io_other(
                 "invalid verification result correlation, length, or token",
             ));
+        }
+        let mut got: Vec<usize> = self.taps.iter().map(|t| t.layer as usize).collect();
+        got.sort_unstable();
+        if got != layers {
+            return Err(io_other(format!(
+                "result carries tapped layers {got:?}, expected {layers:?}"
+            )));
+        }
+        if self.taps.iter().any(|t| {
+            t.data.len() != count * hidden * 2 || t.to_f32().iter().any(|x| !x.is_finite())
+        }) {
+            return Err(io_other("invalid tapped-layer shape or values"));
         }
         Ok(())
     }
@@ -191,6 +247,9 @@ pub struct SessionHello {
     pub next_layer: usize,
     pub max_seq: usize,
     pub chunk: usize,
+    /// Layers of the whole model whose outputs travel back with each result (ascending);
+    /// empty for a plain session. Each node reports the ones it owns.
+    pub taps: Vec<usize>,
 }
 
 impl SessionHello {
@@ -219,6 +278,12 @@ impl SessionHello {
             diffs.push(format!(
                 "chunk {} (this node has {})",
                 got.chunk, self.chunk
+            ));
+        }
+        if got.taps != self.taps {
+            diffs.push(format!(
+                "tapped layers {:?} (this node has {:?})",
+                got.taps, self.taps
             ));
         }
         format!("upstream expects {}", diffs.join(", "))
@@ -352,7 +417,9 @@ impl PeerConnection {
 /// independent halves, so this node starts on the next chunk without waiting for the answer
 /// to the previous one; request/result order stays FIFO and at most 64 results are pending.
 ///
-/// `forward` runs this node's shard on one frame. If anything fails — a bad frame, a lost
+/// `forward` runs this node's shard on one frame and returns the frame for the next node plus
+/// this node's tapped layers, which are added to the matching result on its way up. If
+/// anything fails — a bad frame, a lost
 /// link, or a [`PeerMessage::Error`] from below — the reason is sent upstream and the
 /// downstream connection is closed, so no node is left waiting in a dead session.
 pub async fn relay_middle<F>(
@@ -361,7 +428,7 @@ pub async fn relay_middle<F>(
     mut forward: F,
 ) -> io::Result<()>
 where
-    F: FnMut(HiddenStateFrame) -> io::Result<HiddenStateFrame>,
+    F: FnMut(HiddenStateFrame) -> io::Result<(HiddenStateFrame, Vec<LayerTap>)>,
 {
     let PeerConnection {
         conn: up_conn,
@@ -373,15 +440,16 @@ where
         send: mut down_send,
         recv: mut down_recv,
     } = down;
-    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<(u64, usize)>(64);
+    let (pending_tx, mut pending_rx) =
+        tokio::sync::mpsc::channel::<(u64, usize, Vec<LayerTap>)>(64);
     let transmit = async {
         while let Some(msg) = read_framed::<PeerMessage>(&mut up_recv).await? {
             let PeerMessage::Hidden(frame) = msg else {
                 return Err(io_other("unexpected message during shard session"));
             };
-            let expected = (frame.step, frame.n_tokens as usize);
-            let out = forward(frame)?;
-            pending_tx.send(expected).await.map_err(io_other)?;
+            let (step, n) = (frame.step, frame.n_tokens as usize);
+            let (out, taps) = forward(frame)?;
+            pending_tx.send((step, n, taps)).await.map_err(io_other)?;
             write_framed(&mut down_send, &PeerMessage::Hidden(out)).await?;
         }
         down_send.finish().map_err(io_other)?;
@@ -389,12 +457,13 @@ where
         io::Result::Ok(())
     };
     let receive = async {
-        while let Some((step, n)) = pending_rx.recv().await {
-            let result = match read_framed::<PeerMessage>(&mut down_recv).await? {
+        while let Some((step, n, taps)) = pending_rx.recv().await {
+            let mut result = match read_framed::<PeerMessage>(&mut down_recv).await? {
                 Some(PeerMessage::Result(r)) if r.step == step && r.argmax.len() == n => r,
                 Some(PeerMessage::Error(why)) => return Err(io_other(why)),
                 _ => return Err(io_other("invalid or missing downstream result")),
             };
+            result.taps.extend(taps);
             write_framed(&mut up_send, &PeerMessage::Result(result)).await?;
         }
         io::Result::Ok(())
@@ -575,16 +644,49 @@ mod tests {
         let valid = VerifyResult {
             step: 7,
             argmax: vec![0, 15],
+            taps: Vec::new(),
         };
-        valid.validate(7, 2, 16).unwrap();
-        assert!(valid.validate(8, 2, 16).is_err());
-        assert!(valid.validate(7, 1, 16).is_err());
-        assert!(valid.validate(7, 2, 15).is_err());
+        valid.validate(7, 2, 16, &[], 3).unwrap();
+        assert!(valid.validate(8, 2, 16, &[], 3).is_err());
+        assert!(valid.validate(7, 1, 16, &[], 3).is_err());
+        assert!(valid.validate(7, 2, 15, &[], 3).is_err());
         let invalid = VerifyResult {
             argmax: vec![-1, 1],
             ..valid
         };
-        assert!(invalid.validate(7, 2, 16).is_err());
+        assert!(invalid.validate(7, 2, 16, &[], 3).is_err());
+    }
+
+    #[test]
+    fn tapped_layers_must_match_the_session() {
+        let rows = [1.0f32, -2.5, 3145728.0, 0.0, 0.125, -7.0];
+        let tap = |layer| LayerTap::from_f32(layer, &rows);
+        assert_eq!(tap(3).to_f32(), rows, "these values are exact in bf16");
+        let result = |taps| VerifyResult {
+            step: 1,
+            argmax: vec![4, 5],
+            taps,
+        };
+        // Middles append their taps after the tail's, so arrival order is not layer order.
+        let good = result(vec![tap(9), tap(5)]);
+        good.validate(1, 2, 16, &[5, 9], 3).unwrap();
+        assert!(
+            good.validate(1, 2, 16, &[5], 3).is_err(),
+            "unexpected layer"
+        );
+        assert!(good.validate(1, 2, 16, &[5, 9, 11], 3).is_err(), "missing");
+        assert!(
+            good.validate(1, 2, 16, &[], 3).is_err(),
+            "taps nobody asked for"
+        );
+        assert!(good.validate(1, 2, 16, &[5, 9], 4).is_err(), "wrong width");
+        assert!(result(vec![tap(5), tap(5)])
+            .validate(1, 2, 16, &[5, 9], 3)
+            .is_err());
+        let nan = LayerTap::from_f32(9, &[f32::NAN; 6]);
+        assert!(result(vec![tap(5), nan])
+            .validate(1, 2, 16, &[5, 9], 3)
+            .is_err());
     }
 
     #[test]
@@ -645,6 +747,7 @@ mod tests {
             next_layer: 12,
             max_seq: 768,
             chunk: 8,
+            taps: vec![1, 9],
         };
         let mut wrong = expected.clone();
         wrong.max_seq = 512;
@@ -692,6 +795,7 @@ mod tests {
                 p.send(&PeerMessage::Result(VerifyResult {
                     step: f.step,
                     argmax: vec![f.step as i32],
+                    taps: vec![LayerTap::from_f32(5, &[f.step as f32])],
                 }))
                 .await
                 .unwrap();
@@ -702,7 +806,13 @@ mod tests {
             let up = accept(&middle).await.unwrap();
             let ep = dial_endpoint(&id).unwrap();
             let down = dial(&ep, tail_addr).await.unwrap();
-            relay_middle(up, down, Ok).await.unwrap();
+            // This middle taps layer 2; its tap joins the tail's on the way up.
+            relay_middle(up, down, |f| {
+                let tap = LayerTap::from_f32(2, &[10. + f.step as f32]);
+                Ok((f, vec![tap]))
+            })
+            .await
+            .unwrap();
         };
         let head_fut = async {
             let mut p = dial(&head, middle_addr).await.unwrap();
@@ -720,7 +830,13 @@ mod tests {
             }
             for step in 1..=2 {
                 match p.recv().await.unwrap() {
-                    Some(PeerMessage::Result(r)) => assert_eq!(r.argmax, vec![step]),
+                    Some(PeerMessage::Result(r)) => {
+                        assert_eq!(r.argmax, vec![step]);
+                        r.validate(step as u64, 1, 64, &[2, 5], 1).unwrap();
+                        let by_layer = |l| r.taps.iter().find(|t| t.layer == l).unwrap().to_f32();
+                        assert_eq!(by_layer(5), [step as f32]);
+                        assert_eq!(by_layer(2), [10. + step as f32]);
+                    }
                     _ => panic!("expected result"),
                 }
             }
@@ -763,6 +879,7 @@ mod tests {
             peer.send(&PeerMessage::Result(VerifyResult {
                 step: frame.step,
                 argmax,
+                taps: Vec::new(),
             }))
             .await?;
             peer.wait_closed().await; // hold the connection open until the client has the result
@@ -819,7 +936,10 @@ mod tests {
             let up = accept(&middle).await.unwrap();
             let ep = dial_endpoint(&id).unwrap();
             let down = dial(&ep, tail_addr).await.unwrap();
-            let err = relay_middle(up, down, Ok).await.unwrap_err().to_string();
+            let err = relay_middle(up, down, |f| Ok((f, Vec::new())))
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("tail: out of cache"), "{err}");
         };
         let head_fut = async {
