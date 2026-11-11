@@ -1,8 +1,8 @@
 # DSpark drafters for Qwen3, and what they mean for potpori
 
-Status: design note. Nothing here is implemented in the Rust code yet. The one piece that
-exists is `tools/compare_drafts.py`, which measures the question this note cannot answer
-from reading alone: which draft is better over a real link.
+Status: implemented, and checked on the CPU against the reference implementations with tiny
+models. It has not run on a GPU or with the published checkpoint yet — see
+[Running it](#4-running-it) for the one-machine check that does that.
 
 Sources: the DSpark paper (arXiv 2607.05147), the reference code
 ([deepseek-ai/DeepSpec](https://github.com/deepseek-ai/DeepSpec), MIT, read at commit
@@ -18,12 +18,12 @@ Sources: the DSpark paper (arXiv 2607.05147), the reference code
   tokens per verification on Qwen3-4B, against the 2.67 potpori measured once with
   Qwen3-0.6B.
 - It costs potpori two things. The drafter needs hidden states from layers on every node, so
-  **verification results must carry activations back to the head** (about 160 KiB per chunk
+  **verification results must carry activations back to the head** (about 80 KiB per chunk
   for a two-node split). And it cannot draft ahead of verification, so **pipelining
   (`depth` > 1) is gone**: one block per trip through the chain.
 - Whether that trade wins depends on the link and on how often the small draft gets a whole
-  chunk right. `tools/compare_drafts.py` measures both drafts on the same prompts and prices
-  them with the same clock. Run it before porting anything.
+  chunk right. Both drafts now run in potpori, so the comparison is two `potpori chat` runs
+  with the same prompt; `tools/compare_drafts.py` makes the same comparison in PyTorch.
 
 ## 1. What the drafter is
 
@@ -143,13 +143,13 @@ and 33 are on the tail. Wherever the drafter lives, the other side's taps have t
 The head is the right home: it runs the driver, already holds the embedding table, and its
 own three taps are free. The tail's two taps come back with each verification result:
 
-    8 positions × 2 layers × 2560 × 4 bytes = 160 KiB per chunk (80 KiB as 16-bit floats)
+    8 positions × 2 layers × 2560 × 2 bytes = 80 KiB per chunk
 
-Today a result is eight token ids. The forward frame is already 80 KiB, so the link becomes
-roughly symmetric. On a 20 Mbit/s uplink 160 KiB is about 65 ms; the precision of the
-features only affects how good the drafts are, never the output, so 16-bit is the obvious
-default and coarser encodings are worth trying. Prefill results carry taps for every prompt
-position, once.
+Without a drafter a result is eight token ids. The forward frame is 80 KiB too (f32, one
+layer), so the link becomes symmetric. On a 20 Mbit/s uplink 80 KiB is about 32 ms. Tapped
+layers travel as bf16 — the precision the drafter was trained on. Their precision only
+affects how good the drafts are, never the output, so coarser encodings are worth trying.
+Prefill results carry taps for every prompt position, once.
 
 (Putting the drafter on the tail instead moves the same bytes into the forward frame. No
 gain.)
@@ -173,78 +173,93 @@ code, arithmetic — the answer can flip, more so on slow links.
 Today the head runs Qwen3-0.6B seven times in sequence per chunk (28 layers each). DSpark
 is one pass of five 4B-sized layers over seven rows, plus seven small matrix products.
 
-## 3. Which is better: measure first
+## 3. How potpori runs it
 
-`tools/compare_drafts.py` runs the target, Qwen3-0.6B and the DSpark drafter in PyTorch on
-one GPU and replays potpori's driver logic on their real outputs, greedily:
+- **Taps** (`src/node.rs`). A node exposes a tapped layer by running its range as several
+  shards that end there: with taps 1, 9, 17, 25, 33 the head `[0, 18)` runs `[0,2) [2,10)
+  [10,18)` and the tail `[18, 36)` runs `[18,26) [26,34) [34,36)`. No change to the GPU
+  adapters; three kernel searches per node instead of one, and three calls per chunk.
+- **Wire** (`potpori-shard-v4`). The handshake carries the tapped layers, so a node started
+  without them is refused with a message that says so. Each result carries the outputs of the
+  remote nodes' tapped layers; a middle adds its own to results it relays.
+- **Driver** (`src/specfeat.rs`). One block per trip: draft, verify, hand the features of the
+  settled positions (the pending token and the accepted drafts) to the drafter.
+- **Drafter** (`src/qwen/dspark.rs`). One Luminal graph of 15 rows at consecutive positions:
+  up to 8 context rows, whose keys and values come from `P`, then the 7 block rows. Each call
+  rewrites the last context positions (an overwrite, like the target's rollback) and runs the
+  block behind them; a prompt's context is loaded 15 positions per call. The Markov head and
+  the seven argmaxes run on the CPU. The checkpoint is used as published; the confidence head
+  is not used yet.
 
-- small model at depth 1 and depth 4 (and depth 4 without the drain-before-resubmit wait
-  that the current driver has);
-- DSpark, one block per trip.
+Memory on the head for Qwen3-4B: about 2 GB for the drafter (its layers, plus its own copy
+of the embedding table) and 310 MB of RAM for the Markov head.
 
-It checks every output against plain greedy decoding, reports tokens per trip, how often
-whole chunks are accepted, acceptance by draft position, how well the confidence head
-predicts acceptance, and an estimated tok/s for a list of round-trip times.
+## 4. Running it
 
-On the 5080 (about 11 GB of VRAM for all three models):
+`chain.toml` on the head names the drafter instead of a draft model:
 
-```sh
-git clone https://github.com/deepseek-ai/DeepSpec
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-pip install transformers==5.10.2 safetensors sentencepiece numpy tqdm PyYAML prettytable tensorboard
-python tools/compare_drafts.py --deepspec DeepSpec --json drafts.json
+```toml
+model = "Qwen/Qwen3-4B"
+drafter = "deepseek-ai/dspark_qwen3_4b_block7"
+gamma = 7
 ```
 
-Defaults: 10 prompts each from MT-Bench, HumanEval and GSM8K, 200 new tokens, round trips of
-1, 20, 50, 100 and 200 ms. `--selftest` runs the whole script on tiny random models on a CPU.
+Every remote node adds the tapped layers to its `serve` command (`potpori chat` prints the
+list for the drafter it loaded):
 
-The tok/s estimate uses PyTorch timings from the machine it runs on, with the target's chunk
-time split evenly between head and remote. Once `potpori chat` has been run across the two
-machines, pass its real times (`--head-ms`, `--remote-ms`, `--small-draft-ms`). The estimate
-does not include the time to send tap features back; add it to `--remote-ms` for a link of
-known bandwidth.
+```sh
+potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
+  --layers 18:36 --role tail --chunk 8 --max-seq 768 --taps 1,9,17,25,33
+```
 
-What would decide it:
+`potpori chat` then prints tokens per trip as before, plus the drafter's time per block and
+the size of the tapped layers per result. Remove the `drafter` line (and `--taps`) to run
+the same prompt with the small draft model.
+
+**Start on one machine.** This runs the whole path — both halves of Qwen3-4B, the drafter,
+QUIC over loopback — checks the output against plain greedy decoding through the same
+chain, and prints tokens per trip for three prompts:
+
+```sh
+cargo test --release --features metal dspark_loopback -- --ignored --nocapture   # or cuda
+```
+
+It downloads about 11 GB and runs seven kernel searches, so the first run takes a while.
+
+### What has been checked, and what has not
+
+Checked, on the CPU with tiny random models (`cargo test --features reference`, also in CI):
+
+- the drafter graph gives DeepSpec's logits and DeepSpec's tokens, call after call, as the
+  context grows by zero to eight positions, and after going back to an earlier position;
+- the target cut at the tapped layers gives transformers' logits, and the tapped outputs
+  equal transformers' `hidden_states` for the configured layers;
+- the whole loop reproduces the target's greedy output;
+- the protocol, over QUIC with synthetic shards: features reach the head in layer order
+  through two- and three-node chains, and mismatched taps are refused at connect.
+
+Not checked: anything on a GPU. The CUDA and Metal adapters compile the drafter graph like
+any shard, but the graph has operations in a new combination (attention without a bias, a
+row gather before the output head), and kernel search for it has never run. The published
+checkpoint has not been loaded: the tests use a checkpoint written by DeepSpec's own model
+class at tiny size, so the tensor names and layout match, but the 2.8 GB file is untested.
+`dspark_loopback` covers both.
+
+### Which is better
+
+Two `potpori chat` runs with the same prompt, with and without the `drafter` line, give the
+real answer for your link. `tools/compare_drafts.py` asks the same question in PyTorch on
+one GPU: it replays both drivers on real model outputs, greedily, and estimates tok/s for a
+list of round-trip times (`--selftest` runs it on tiny random models).
 
 | Result | Reading |
 |---|---|
-| DSpark's tokens per trip well above the small model's, small model's full chunks under ~20 % | Port DSpark. Pipelining was not buying much. |
+| DSpark's tokens per trip well above the small model's, small model's full chunks under ~20 % | DSpark. Pipelining was not buying much. |
 | Small model's full chunks above ~50 % on the prompts you care about | Keep the small model for those; pipelining is doing real work. |
-| Close | Link latency decides; read the tok/s table at your round trip. |
+| Close | Link latency decides. |
 
-## 4. The port, if the numbers say yes
-
-In order. Steps 1–3 need no GPU; 4–5 need iteration on real hardware.
-
-1. **Qwen3-4B as an ordinary potpori target.** It should already work (`config_for`); it has
-   not been run. The two-machine runbook uses it.
-2. **Wire format** (`potpori-shard-v4`). `SessionHello` gains the list of tapped layers so
-   each node knows which of its own to report. `VerifyResult` gains an optional feature
-   block (layer ids, rows, dtype, bytes). A middle adds its own taps to results it relays.
-   `HiddenStateFrame` is unchanged.
-3. **Driver.** A feature-aware draft trait (`observe(features)`, `draft(anchor, start)`) and
-   a one-block-per-trip loop: this is `specdecode.rs` plus features, and
-   `run_dspark` in the comparison script is the reference. `PipelinedChain::poll` returns
-   tokens and features. All of it can be tested with the existing fake shards.
-4. **Taps from the shards.** Two ways:
-   - *Split at the taps.* A node runs several shards in a row — head `[0,2) [2,10) [10,18)`,
-     tail `[18,26) [26,34) [34,36)` — and each shard's output is a tap. No change to the
-     Luminal adapters; more graphs to search and more calls per chunk.
-   - *Multi-output graphs.* The graph returns the tapped layers alongside its normal output.
-     Faster, but the CUDA and Metal adapters read one output today.
-
-   Start with the first.
-5. **The drafter as a Luminal graph.** Everything it needs exists in `luminal_nn`
-   (`paged_attention` takes an explicit bias, so non-causal attention is a zero bias). One
-   fixed-shape graph of 15 rows: 8 context rows whose keys and values come from `P`, 7 block
-   rows. Each call rewrites the last 8 context positions (an overwrite, like the target's
-   rollback) and reads the block. The prompt's context is written 8 rows at a time. The
-   Markov head and the argmaxes run on the host. Load only the new weights (~1.2 GB BF16);
-   the output head is the head node's embedding table.
-6. **Check.** Same prompts, potpori against the Python script: identical drafts, identical
-   tokens per trip.
-
-Then Qwen3-8B and 14B: the same architecture and released drafters, so mostly config.
+Qwen3-8B and 14B have released drafters and the same architecture; they need config entries
+and, for a split with more than two nodes, nothing else.
 
 ## 5. Later: getting pipelining back
 

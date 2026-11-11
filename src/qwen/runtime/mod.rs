@@ -1,4 +1,5 @@
-//! Luminal backend adapters (CUDA, Metal) behind one small trait. A runtime is created empty
+//! Luminal backend adapters (CUDA, Metal, and the CPU reference executor for tests) behind one
+//! small trait. A runtime is created empty
 //! with `Default`, compiled once for a shard's graph, then stepped; device allocations
 //! outlive the compiled programs.
 use super::model::{Inputs, QwenGraph};
@@ -26,6 +27,11 @@ mod cuda_memory;
 mod metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_memory;
+#[cfg(feature = "reference")]
+mod reference;
+#[cfg(feature = "reference")]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use reference::CpuRuntime;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 macro_rules! adapter {
     ($name:ident, $module:ident, $backend:ident, $native:ident) => {

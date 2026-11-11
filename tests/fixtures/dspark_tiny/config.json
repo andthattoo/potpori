@@ -1,0 +1,49 @@
+{
+  "architectures": [
+    "Qwen3DSparkModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "block_size": 7,
+  "bos_token_id": null,
+  "confidence_head_with_markov": true,
+  "enable_confidence_head": true,
+  "eos_token_id": null,
+  "head_dim": 4,
+  "hidden_act": "silu",
+  "hidden_size": 16,
+  "initializer_range": 0.02,
+  "intermediate_size": 32,
+  "layer_types": [
+    "full_attention",
+    "full_attention"
+  ],
+  "markov_head_type": "vanilla",
+  "markov_rank": 4,
+  "mask_token_id": 63,
+  "max_position_embeddings": 128,
+  "max_window_layers": 28,
+  "model_type": "qwen3",
+  "num_anchors": 8,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 2,
+  "num_key_value_heads": 2,
+  "num_target_layers": 6,
+  "pad_token_id": null,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 10000.0,
+    "rope_type": "default"
+  },
+  "sliding_window": null,
+  "target_layer_ids": [
+    0,
+    2,
+    4
+  ],
+  "tie_word_embeddings": false,
+  "transformers_version": "5.10.2",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 64
+}

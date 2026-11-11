@@ -17,6 +17,11 @@ pub struct ChainConfig {
     /// Draft model HF repo (runs entirely on the head). Small + same tokenizer family.
     #[serde(default = "default_draft")]
     pub draft_model: String,
+    /// A DSpark drafter for the target (HF repo), used instead of `draft_model`: it reads the
+    /// target's hidden states, so every node reports the layers it needs (`serve --taps`) and
+    /// one block is verified per trip (`depth` does not apply).
+    #[serde(default)]
+    pub drafter: Option<String>,
     /// Draft length γ per round; the verify chunk is γ+1 tokens.
     #[serde(default = "default_gamma")]
     pub gamma: usize,
@@ -81,6 +86,13 @@ impl ChainConfig {
             .ok_or_else(|| anyhow::anyhow!("unsupported target model {}", self.model))?;
         if model_layers(&self.draft_model).is_none() {
             bail!("unsupported draft model {}", self.draft_model);
+        }
+        if self
+            .drafter
+            .as_ref()
+            .is_some_and(|repo| repo.trim().is_empty())
+        {
+            bail!("drafter must name a model repository");
         }
         if self.gamma == 0 || self.gamma.checked_add(1).is_none_or(|c| c > self.max_seq) {
             bail!("require 1 <= gamma < max_seq");
@@ -172,6 +184,7 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.gamma, 7);
         assert_eq!(cfg.draft_model, "Qwen/Qwen3-0.6B");
+        assert_eq!(cfg.drafter, None);
         assert_eq!(cfg.nodes.len(), 3);
     }
 
@@ -189,5 +202,20 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a_drafter_is_optional_and_must_be_named() {
+        let with = |line: &str| -> ChainConfig {
+            let text = include_str!("../chain.example.toml");
+            toml::from_str(&format!("{line}\n{text}")).unwrap()
+        };
+        let cfg = with(r#"drafter = "deepseek-ai/dspark_qwen3_4b_block7""#);
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.drafter.as_deref(),
+            Some("deepseek-ai/dspark_qwen3_4b_block7")
+        );
+        assert!(with(r#"drafter = " ""#).validate().is_err());
     }
 }

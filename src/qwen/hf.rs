@@ -239,24 +239,53 @@ pub fn load_inputs(
         let tensor = tensors.tensor(&p.name)?;
         anyhow::ensure!(tensor.shape() == p.shape, "shape mismatch for {}", p.name);
         let data = match p.dtype {
-            DType::Bf16 => {
-                anyhow::ensure!(tensor.dtype() == Dtype::BF16, "expected BF16 {}", p.name);
-                TensorData::BF16(
-                    tensor
-                        .data()
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        .collect(),
-                )
-            }
+            DType::Bf16 if tensor.dtype() == Dtype::BF16 => TensorData::BF16(
+                tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect(),
+            ),
+            // A checkpoint used as published may store a matrix in another float type.
+            DType::Bf16 => TensorData::BF16(
+                tensor_to_f32(&tensor)
+                    .into_iter()
+                    .map(|x| bf16::from_f32(x).to_bits())
+                    .collect(),
+            ),
             DType::F32 => TensorData::F32(tensor_to_f32(&tensor)),
             _ => anyhow::bail!("unsupported parameter dtype"),
         };
         inputs.insert(p.input, data);
     }
     Ok(inputs)
+}
+
+/// Read one tensor of a safetensors file as f32, checking its shape.
+pub fn read_f32(path: &Path, name: &str, shape: &[usize]) -> anyhow::Result<Vec<f32>> {
+    let file = File::open(path)?;
+    // SAFETY: model files are immutable and stay mapped throughout decoding.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)?;
+    let tensor = tensors.tensor(name)?;
+    anyhow::ensure!(tensor.shape() == shape, "shape mismatch for {name}");
+    Ok(tensor_to_f32(&tensor))
+}
+
+/// Whether tensors `a` and `b` of a safetensors file hold the same values — tied weights
+/// saved twice. A missing `b` counts as tied.
+pub fn same_tensor(path: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
+    let file = File::open(path)?;
+    // SAFETY: model files are immutable and stay mapped throughout the comparison.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)?;
+    let a = tensors.tensor(a)?;
+    Ok(match tensors.tensor(b) {
+        Ok(b) => a.dtype() == b.dtype() && a.shape() == b.shape() && a.data() == b.data(),
+        Err(_) => true,
+    })
 }
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
@@ -287,6 +316,13 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
         repo.get(shard_file)?;
     }
     Ok(model_dir)
+}
+
+/// Download a DSpark drafter checkpoint; returns the paths of its `config.json` and
+/// `model.safetensors`. The file is used as published, with no preparation step.
+pub fn download_drafter(repo_id: &str) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let repo = Api::new()?.model(repo_id.to_string());
+    Ok((repo.get("config.json")?, repo.get("model.safetensors")?))
 }
 
 /// Downloads a model from HuggingFace and prepares it for use.

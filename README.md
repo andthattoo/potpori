@@ -99,12 +99,13 @@ single file in the Hugging Face cache; allow disk for a second copy) and searche
 for the shard, which takes minutes. The head waits up to 15 minutes for a node that is still
 loading.
 
-`chat` ends with three lines of measurements:
+`chat` ends with four lines of measurements:
 
 ```text
-[212 tokens in 21.4s = 9.9 tok/s overall, 11.6 tok/s after prefill | 2.71 tok/traversal over 78 traversals | γ=7 depth=4 chain=2 nodes]
+[212 tokens in 21.4s = 9.9 tok/s overall, 11.6 tok/s after prefill | 2.71 tok/traversal over 78 traversals | γ=7 chain=2 nodes]
 [time: prefill 3.10s (41 prompt tokens) | head shard 4.20s | waiting on chain 9.80s | draft + rest 4.30s]
 [link: round trip 38.2 ms at connect, 36.9 ms now | 85 frames, 80.0 KiB each | head on metal]
+[draft model Qwen/Qwen3-0.6B, depth=4]
 ```
 
 `tok/traversal` is how many tokens each trip through the chain committed (draft acceptance).
@@ -113,17 +114,32 @@ what pipelining buys over a given link.
 
 For a first run between two machines, follow [docs/two-machine-test.md](docs/two-machine-test.md).
 
+### A drafter that reads the target
+
+Instead of a small draft model, the head can run a [DSpark](docs/dspark.md) drafter: a few
+extra layers that read the target's own hidden states and propose a block of seven tokens in
+one pass. Its guesses are better, but it cannot draft ahead, so one block is verified per
+trip and `depth` does not apply. Add `drafter = "deepseek-ai/dspark_qwen3_4b_block7"` to
+`chain.toml` and `--taps 1,9,17,25,33` to every `serve` command. This path has been checked
+on the CPU against the reference implementation but not yet on a GPU;
+[docs/dspark.md](docs/dspark.md) has the one-machine check to run first.
+
 ## Checks
 
 ```sh
 cargo test --locked                       # drivers, wire and chain protocol — no GPU
 cargo test --locked --features engine     # plus model and weight-preparation checks — no GPU
 cargo clippy --locked --features engine --all-targets -- -D warnings
+cargo test --locked --features reference cpu_check   # the real graphs on tiny models — CPU, minutes
 ```
 
 The chain protocol is tested end to end over real QUIC with a synthetic shard: two- and
 three-node chains against greedy decoding, handshake refusals, malformed frames, and failing
 or vanishing nodes.
+
+The `reference` feature runs the real Luminal graphs on Luminal's CPU executor with tiny
+models: the shard cut and KV rollback, and the tapped layers and DSpark drafter against
+outputs of transformers and DeepSpec (`tests/fixtures/dspark_tiny`).
 
 GPU tests are `#[ignore]`d and run by name:
 
@@ -132,6 +148,8 @@ GPU tests are `#[ignore]`d and run by name:
 cargo test --locked --release --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
 # Metal: real Qwen3-0.6B chain over loopback QUIC vs a single process
 cargo test --locked --release --features metal qwen_chain_equals_single_process -- --ignored --nocapture
+# Either backend: Qwen3-4B with its DSpark drafter over loopback QUIC vs greedy (11 GB download)
+cargo test --locked --release --features metal dspark_loopback -- --ignored --nocapture
 ```
 
 The other Metal tests (`qwen_cut_2shard`, `qwen_pipelined_chain_equals_greedy`,
@@ -148,7 +166,8 @@ way. Metal execution has not been validated since the Luminal migration; see
 | `src/node.rs` | The head, middle and tail roles, generic over a shard. |
 | `src/specpipe.rs`, `src/specdecode.rs` | The pipelined driver and the one-chunk-at-a-time reference driver. |
 | `src/qwen/` | Qwen3 on Luminal: graph, CUDA/Metal runtimes, weights, tokenizer, shard, draft. |
-| `docs/dspark.md` | DSpark drafters for Qwen3: how they work, what they would change here, how to compare them with the small-model draft. |
+| `src/specfeat.rs`, `src/qwen/dspark.rs` | The one-block-per-trip driver and the DSpark drafter it drives. |
+| `docs/dspark.md` | DSpark drafters for Qwen3: how they work, how potpori runs them, what has been checked. |
 | `tools/compare_drafts.py` | Measures both kinds of draft on one GPU (PyTorch). |
 | `docs/luminal-migration.md` | What changed with the current Luminal revision, and what has been validated. |
 | `docs/history/` | Earlier design notes, kept for the reasoning. |

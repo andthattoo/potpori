@@ -102,6 +102,18 @@ The three bracketed lines `chat` prints at the end, for both depths:
 
 Also note which machine was the head and which backend each side ran.
 
+## 6. The same run with a DSpark drafter
+
+A [DSpark drafter](dspark.md) replaces the draft model. Check it on one machine first
+(`dspark_loopback` in the README), then:
+
+- restart the tail with `--taps 1,9,17,25,33` added to the command in step 3;
+- add `drafter = "deepseek-ai/dspark_qwen3_4b_block7"` to `chain.toml` on the head.
+
+Run the same prompt. `--depth` has no effect here. Compare **tok/traversal** and tok/s with
+the runs above; the last line also shows the drafter's time per block and how many KiB of
+tapped layers come back with each result.
+
 ## When it does not work
 
 | You see | Meaning |
@@ -111,5 +123,6 @@ Also note which machine was the head and which backend each side ran.
 | `the chain refused the session — node [18, 36): upstream expects …` | The tail was started with settings that differ from `chain.toml`; the message lists each one (model, layer boundary, `max_seq`, chunk). |
 | `the chain failed — node [18, 36): invalid hidden-state …` | The tail rejected a frame: wrong shape, a position past its cache, or non-finite values coming out of the head's shard. |
 | `the chain failed — node [18, 36): the shard produced missing or non-finite logits` | The tail's own kernels produced NaN or infinity. |
+| `… upstream expects tapped layers [1, 9, 17, 25, 33] (this node has [])` | The chain config names a drafter and this node was started without `--taps` (or the other way round). |
 | A panic mentioning `non-finite or empty logits` on the head | The draft model or the head shard produced NaN locally. |
 | Sensible text, but `tok/traversal` close to 1.0 | The draft is rarely right. If the same prompt accepts well with both models on one machine, suspect a numerical difference between the two backends. |

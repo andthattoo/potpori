@@ -105,15 +105,18 @@ pub struct QwenGraph {
     pub chunk_size: usize,
     pub cfg: QwenConfig,
     pub first: bool,
-    input: NodeIndex,
-    positions: NodeIndex,
-    gather: NodeIndex,
-    cos: NodeIndex,
-    sin: NodeIndex,
-    rotation: NodeIndex,
+    pub(super) input: NodeIndex,
+    pub(super) positions: NodeIndex,
+    pub(super) gather: NodeIndex,
+    pub(super) cos: NodeIndex,
+    pub(super) sin: NodeIndex,
+    pub(super) rotation: NodeIndex,
+    /// Set for a DSpark drafter graph ([`super::dspark`]), which has more step inputs and
+    /// runs a fixed number of rows.
+    pub(super) drafter: Option<super::dspark::DrafterPorts>,
 }
 
-fn weight(
+pub(super) fn weight(
     cx: &mut Graph,
     params: &mut Vec<Parameter>,
     name: String,
@@ -280,13 +283,25 @@ impl QwenGraph {
             cos: cos.id,
             sin: sin.id,
             rotation: rotation.id,
+            drafter: None,
         })
     }
     pub fn rope_matrices(&self) -> Vec<NodeIndex> {
         vec![self.rotation]
     }
     pub fn step_input_ids(&self) -> Vec<NodeIndex> {
-        vec![self.input, self.positions, self.gather, self.cos, self.sin]
+        let mut ids = vec![self.input, self.positions, self.gather, self.cos, self.sin];
+        if let Some(ports) = &self.drafter {
+            ids.extend(ports.ids());
+        }
+        ids
+    }
+    /// Representative step inputs for kernel search: `q` rows with `c` positions visible.
+    pub fn profile_inputs(&self, q: usize, c: usize) -> Result<Inputs> {
+        match &self.drafter {
+            Some(_) => super::dspark::profile_inputs(self, c),
+            None => self.step_inputs(self.profile_input(q), q, c - q),
+        }
     }
     pub fn initial_inputs(&self) -> Inputs {
         let mut data = Inputs::default();
@@ -360,7 +375,10 @@ pub struct BucketPlan<P, O> {
 }
 pub fn buckets(graph: &QwenGraph) -> Result<Vec<BucketSpec>> {
     let mut qs = vec![(1, 1, 1)];
-    if graph.chunk_size == 0 && graph.capacity > 1 {
+    if graph.drafter.is_some() {
+        // A drafter always runs the same number of rows.
+        qs = vec![(graph.chunk_size, graph.chunk_size, graph.chunk_size)];
+    } else if graph.chunk_size == 0 && graph.capacity > 1 {
         qs.push((2, graph.capacity, graph.capacity.min(8)));
     } else if graph.chunk_size > 1 {
         qs.push((graph.chunk_size, graph.chunk_size, graph.chunk_size));

@@ -76,7 +76,7 @@ impl MetalBackend {
         for spec in crate::qwen::model::buckets(graph)? {
             let q = spec.profile_dims()[&'q'.into()];
             let c = spec.profile_dims()[&'c'.into()];
-            for (id, value) in graph.step_inputs(graph.profile_input(q), q, c - q)? {
+            for (id, value) in graph.profile_inputs(q, c)? {
                 data.insert(id, host(value));
             }
             let mut runtime =

@@ -14,6 +14,10 @@
 
 model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for now)
 draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
+# Or a DSpark drafter for the target instead of a draft model (see docs/dspark.md). It reads
+# the target's hidden states, so every `potpori serve` also needs `--taps 1,9,17,25,33`
+# (`potpori chat` prints the list), and `depth` no longer applies:
+# drafter = "deepseek-ai/dspark_qwen3_4b_block7"
 gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
 max_seq = 768                     # KV size on every shard; prompt + max_new must fit
 depth = 4                         # verification chunks in flight (`chat --depth` overrides)

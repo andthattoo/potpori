@@ -8,6 +8,7 @@
 //!   baseline in tests. [`draft`] wraps it as the head's incremental draft engine.
 
 pub mod draft;
+pub mod dspark;
 pub mod hf;
 pub mod model;
 pub mod runtime;
@@ -19,8 +20,17 @@ pub mod tok;
 // and the chain protocol over real Metal shards.
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
 mod chain_tests;
+#[cfg(all(test, feature = "reference"))]
+mod cpu_check;
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_check;
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))
+))]
+mod dspark_check;
+#[cfg(all(test, any(feature = "cuda", feature = "reference")))]
+mod tiny;
 
 use crate::engine::TokenId;
 use model::QwenConfig;

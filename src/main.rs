@@ -130,6 +130,11 @@ enum Cmd {
         /// Kernel search budget per shard load (kernel quality vs startup time)
         #[arg(long, default_value_t = 200)]
         search_graphs: usize,
+        /// Layers whose outputs go back to the head with each result, e.g. 1,9,17,25,33 —
+        /// for a chain whose config names a `drafter`. `potpori chat` prints the list. The
+        /// node runs one shard per stretch between tapped layers.
+        #[arg(long, value_delimiter = ',')]
+        taps: Vec<usize>,
     },
     /// Run the head: prompt in → sharded, speculatively decoded generation out.
     Chat {
@@ -211,15 +216,19 @@ mod run {
     use anyhow::{anyhow, bail, Result};
 
     use crate::chain::ChainConfig;
-    use crate::node::{serve_middle, serve_tail, ChainLink, ShardEngine as _};
+    use crate::node::{
+        serve_middle, serve_tail, tap_ranges, ChainLink, ShardEngine as _, TappedShards,
+    };
     use crate::qwen::draft::IncrementalDraft;
-    use crate::qwen::hf::{prepare_hf_model, COMBINED_WEIGHTS_FILE};
+    use crate::qwen::dspark::{DsparkConfig, DsparkDraft};
+    use crate::qwen::hf::{download_drafter, prepare_hf_model, COMBINED_WEIGHTS_FILE};
     use crate::qwen::model::QwenConfig;
     use crate::qwen::shard::Shard;
     use crate::qwen::target::QwenTarget;
     use crate::qwen::tok::ChatTokenizer;
     use crate::qwen::{config_for, EOS_TOKENS};
-    use crate::specdecode::SpecConfig;
+    use crate::specdecode::{SpecConfig, SpecStats};
+    use crate::specfeat::run_feature_decode;
     use crate::specpipe::run_spec_decode_pipelined;
     use crate::transport::{listen_endpoint, TlsIdentity};
     use crate::{Cmd, Role};
@@ -254,6 +263,7 @@ mod run {
                 max_seq,
                 chunk,
                 search_graphs,
+                taps,
                 tls,
             } => serve(
                 listen,
@@ -264,6 +274,7 @@ mod run {
                 max_seq,
                 chunk,
                 search_graphs,
+                taps,
                 tls.load()?,
             ),
             Cmd::Chat {
@@ -292,6 +303,48 @@ mod run {
             .into_owned())
     }
 
+    /// Load layers `range` of `model` as one shard per stretch between tapped layers (a
+    /// single shard when nothing is tapped).
+    fn load_node(
+        model: &str,
+        range: (usize, usize),
+        taps: &[usize],
+        max_seq: usize,
+        search_graphs: usize,
+        chunk: usize,
+    ) -> Result<TappedShards<Shard<Backend>>> {
+        let cfg = known_config(model)?;
+        if let Some(bad) = taps.iter().find(|&&layer| layer + 1 >= cfg.layers) {
+            bail!(
+                "layer {bad} cannot be tapped: taps must be below the last layer ({})",
+                cfg.layers - 1
+            );
+        }
+        let weights = weights_for(model)?;
+        let ranges = tap_ranges(range, taps);
+        let parts = ranges
+            .iter()
+            .map(|&(a, b)| {
+                tracing::info!(
+                    "loading shard [{a},{b}) of {model} on {BACKEND} — kernel search, takes \
+                     minutes…"
+                );
+                Shard::load_chunked(
+                    new_runtime(),
+                    cfg,
+                    (a, b),
+                    a == 0,
+                    b == cfg.layers,
+                    &weights,
+                    max_seq,
+                    search_graphs,
+                    chunk,
+                )
+            })
+            .collect();
+        TappedShards::new(parts, taps.to_vec())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn serve(
         listen: SocketAddr,
@@ -302,6 +355,7 @@ mod run {
         max_seq: usize,
         chunk: usize,
         search_graphs: usize,
+        taps: Vec<usize>,
         tls: TlsIdentity,
     ) -> Result<()> {
         // Validate everything cheap before the download and kernel search.
@@ -325,22 +379,7 @@ mod run {
             }
             (Role::Middle, None) => bail!("--downstream is required for middles"),
         }
-        let wp = weights_for(&model)?;
-
-        tracing::info!(
-            "loading shard [{a},{b}) of {model} on {BACKEND} — kernel search, takes minutes…"
-        );
-        let mut shard = Shard::load_chunked(
-            new_runtime(),
-            cfg,
-            (a, b),
-            false,
-            role == Role::Tail,
-            &wp,
-            max_seq,
-            search_graphs,
-            chunk,
-        );
+        let mut shard = load_node(&model, (a, b), &taps, max_seq, search_graphs, chunk)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -349,7 +388,10 @@ mod run {
             let _g = rt.enter();
             listen_endpoint(listen, &tls).map_err(|e| anyhow!("listen on {listen}: {e}"))?
         };
-        tracing::info!("shard ready — serving [{a},{b}) as {role:?} on {listen}");
+        tracing::info!(
+            "shard ready — serving [{a},{b}) as {role:?} on {listen}, reporting layers {:?}",
+            shard.tap_layers()
+        );
         loop {
             shard.reset(); // fresh KV per session
             let res = match downstream {
@@ -396,78 +438,128 @@ mod run {
             );
         }
 
-        tracing::info!("loading draft model {} on {BACKEND}…", cc.draft_model);
-        let draft_target = QwenTarget::load_chunked(
-            new_runtime(),
-            known_config(&cc.draft_model)?,
-            &weights_for(&cc.draft_model)?,
-            cc.max_seq,
-            cc.search_graphs,
-            chunk, // kernels for {1, γ+1} tokens, as on the head and the remote shards
-        );
-        let mut draft = IncrementalDraft::new(draft_target, chunk);
-
         let head_range = (cc.nodes[0].layers[0], cc.nodes[0].layers[1]);
-        tracing::info!(
-            "loading head shard [{},{}) of {} — kernel search, takes minutes…",
-            head_range.0,
-            head_range.1,
-            cc.model
-        );
-        let head = Shard::load_chunked(
-            new_runtime(),
-            known_config(&cc.model)?,
-            head_range,
-            true,
-            false,
-            &weights_for(&cc.model)?,
-            cc.max_seq,
-            cc.search_graphs,
-            chunk,
-        );
-        {
-            // Feeds the prompt into the draft's KV (not wasted work) and fails here, rather
-            // than mid-generation, if the draft's kernels produce non-finite logits.
-            use crate::engine::DraftEngine as _;
-            let probe = draft.draft(&ids, 1);
-            tracing::info!("draft model ready (first prediction = {})", probe[0]);
-        }
-
         let next_addr: SocketAddr = cc.nodes[1]
             .addr
             .as_ref()
             .expect("validated: remote nodes have addrs")
             .parse()?;
-        tracing::info!("prompt = {} tokens; connecting to {next_addr}…", ids.len());
-        let mut chain = ChainLink::connect(head, next_addr, &tls, &EOS_TOKENS, CONNECT_WAIT)?;
-        let rtt_at_connect = chain.rtt();
-        tracing::info!(
-            "chain ready — round trip to the next node {:.1} ms",
-            rtt_at_connect.as_secs_f64() * 1e3
-        );
+        let connect = |head, prompt_tokens: usize| -> Result<ChainLink<_>> {
+            tracing::info!("prompt = {prompt_tokens} tokens; connecting to {next_addr}…");
+            let chain = ChainLink::connect(head, next_addr, &tls, &EOS_TOKENS, CONNECT_WAIT)?;
+            tracing::info!(
+                "chain ready — round trip to the next node {:.1} ms",
+                chain.rtt().as_secs_f64() * 1e3
+            );
+            Ok(chain)
+        };
 
-        let t0 = Instant::now();
-        let generated = run_spec_decode_pipelined(
-            &mut draft,
-            &mut chain,
-            &ids,
-            &SpecConfig {
-                gamma: cc.gamma,
-                max_new,
-            },
-            depth,
-        );
-        let dt = t0.elapsed().as_secs_f64();
-        chain.shutdown();
-        let (out, stats) = generated?;
+        let (out, stats, dt, link, rtts, how): (Vec<_>, SpecStats, f64, _, _, String);
+        if let Some(repo) = &cc.drafter {
+            // A drafter that reads the target's hidden states: one block per trip.
+            let (config, weights) =
+                download_drafter(repo).map_err(|e| anyhow!("download {repo}: {e}"))?;
+            let dcfg = DsparkConfig::from_json(&std::fs::read_to_string(config)?)?;
+            dcfg.check_target(&known_config(&cc.model)?)?;
+            if dcfg.block != cc.gamma {
+                bail!(
+                    "{repo} drafts {} tokens per block: set gamma = {} in the chain config \
+                     (and --chunk {} on every node)",
+                    dcfg.block,
+                    dcfg.block,
+                    dcfg.block + 1
+                );
+            }
+            let taps: Vec<String> = dcfg.taps.iter().map(|l| l.to_string()).collect();
+            tracing::info!(
+                "{repo} reads target layers {:?}: every remote node must be started with \
+                 --taps {}",
+                dcfg.taps,
+                taps.join(",")
+            );
+            let head = load_node(
+                &cc.model,
+                head_range,
+                &dcfg.taps,
+                cc.max_seq,
+                cc.search_graphs,
+                chunk,
+            )?;
+            tracing::info!("loading drafter {repo} on {BACKEND}…");
+            let mut draft =
+                DsparkDraft::load(new_runtime(), dcfg, &weights, cc.max_seq, cc.search_graphs)?;
+            let mut chain = connect(head, ids.len())?;
+            let rtt_at_connect = chain.rtt();
+            let t0 = Instant::now();
+            let generated = run_feature_decode(&mut draft, &mut chain, &ids, max_new);
+            dt = t0.elapsed().as_secs_f64();
+            chain.shutdown();
+            (out, stats) = generated?;
+            link = chain.stats();
+            rtts = (rtt_at_connect, chain.rtt());
+            let d = draft.stats();
+            how = format!(
+                "drafter {repo}: {} blocks, {:.1} ms graph + {:.1} ms markov each | {:.1} KiB \
+                 of tapped layers per result",
+                d.drafts,
+                d.graph.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
+                d.markov.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
+                link.tap_bytes as f64 / link.frames.max(1) as f64 / 1024.0,
+            );
+        } else {
+            tracing::info!("loading draft model {} on {BACKEND}…", cc.draft_model);
+            let draft_target = QwenTarget::load_chunked(
+                new_runtime(),
+                known_config(&cc.draft_model)?,
+                &weights_for(&cc.draft_model)?,
+                cc.max_seq,
+                cc.search_graphs,
+                chunk, // kernels for {1, γ+1} tokens, as on the head and the remote shards
+            );
+            let mut draft = IncrementalDraft::new(draft_target, chunk);
+            let head = load_node(
+                &cc.model,
+                head_range,
+                &[],
+                cc.max_seq,
+                cc.search_graphs,
+                chunk,
+            )?;
+            {
+                // Feeds the prompt into the draft's KV (not wasted work) and fails here,
+                // rather than mid-generation, if the draft's kernels produce non-finite
+                // logits.
+                use crate::engine::DraftEngine as _;
+                let probe = draft.draft(&ids, 1);
+                tracing::info!("draft model ready (first prediction = {})", probe[0]);
+            }
+            let mut chain = connect(head, ids.len())?;
+            let rtt_at_connect = chain.rtt();
+            let t0 = Instant::now();
+            let generated = run_spec_decode_pipelined(
+                &mut draft,
+                &mut chain,
+                &ids,
+                &SpecConfig {
+                    gamma: cc.gamma,
+                    max_new,
+                },
+                depth,
+            );
+            dt = t0.elapsed().as_secs_f64();
+            chain.shutdown();
+            (out, stats) = generated?;
+            link = chain.stats();
+            rtts = (rtt_at_connect, chain.rtt());
+            how = format!("draft model {}, depth={depth}", cc.draft_model);
+        }
 
         println!("\n{}", tok.decode(&out)?);
-        let link = chain.stats();
         let secs = |d: Duration| d.as_secs_f64();
         let after_prefill = (dt - secs(link.prefill)).max(1e-9);
         eprintln!(
             "\n[{} tokens in {dt:.1}s = {:.1} tok/s overall, {:.1} tok/s after prefill | {:.2} \
-             tok/traversal over {} traversals | γ={} depth={depth} chain={} nodes]",
+             tok/traversal over {} traversals | γ={} chain={} nodes]",
             out.len(),
             out.len() as f64 / dt,
             out.len() as f64 / after_prefill,
@@ -488,11 +580,12 @@ mod run {
         eprintln!(
             "[link: round trip {:.1} ms at connect, {:.1} ms now | {} frames, {:.1} KiB each | \
              head on {BACKEND}]",
-            secs(rtt_at_connect) * 1e3,
-            secs(chain.rtt()) * 1e3,
+            secs(rtts.0) * 1e3,
+            secs(rtts.1) * 1e3,
             link.frames,
             link.payload_bytes as f64 / link.frames.max(1) as f64 / 1024.0,
         );
+        eprintln!("[{how}]");
         Ok(())
     }
 }

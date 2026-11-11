@@ -18,6 +18,16 @@ jobs:
       - run: cargo clippy --locked --features engine --all-targets -- -D warnings
       - if: runner.os == 'macOS'
         run: cargo check --locked --features metal --all-targets
+  # The real graphs on Luminal's CPU reference executor with tiny models: the shard cut, the
+  # tapped layers and the DSpark drafter against transformers and DeepSpec outputs.
+  reference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add clippy
+      - run: cargo clippy --locked --features reference --all-targets -- -D warnings
+      - run: cargo test --locked --features reference cpu_check
   cuda-build:
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.9.1-devel-ubuntu24.04
