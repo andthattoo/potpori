@@ -68,7 +68,11 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
         while inflight.len() < depth && !done {
             let cur = *dprefix.last().unwrap();
             if chain.is_eos(cur) {
-                done = true;
+                // The draft *speculates* EOS here. Stop extending the pipeline, but do NOT set
+                // `done`: only a verified commit may end generation. Setting it here discarded
+                // the still-in-flight (valid) chunks and truncated the output at depth >= 3.
+                // If the EOS guess was wrong, the divergence path resets `dprefix` and filling
+                // resumes.
                 break;
             }
             let ds = draft.draft(&dprefix, gamma);
@@ -261,5 +265,226 @@ mod tests {
         let (pipe_out, _) = run_spec_decode_pipelined(&mut pd, &mut pc, &prompt, &cfg, 4);
 
         assert_eq!(sync_out, pipe_out, "pipelined output must equal synchronous output");
+    }
+
+    // ---- Stateful synthetic chain: catches position-bookkeeping bugs, not just accept logic ----
+
+    /// Deterministic "model": the next token is a hash of the whole prefix, with EOS forced once
+    /// `eos_at` tokens have been generated. Unlike `SyntheticPipe`, the answer depends on the
+    /// tokens actually fed, so a driver that submits the wrong tokens/positions gets caught.
+    #[derive(Clone, Copy)]
+    struct Oracle {
+        prompt_len: usize,
+        eos_at: Option<usize>,
+        eos: TokenId,
+    }
+    impl Oracle {
+        fn next(&self, prefix: &[TokenId]) -> TokenId {
+            let generated = prefix.len() - self.prompt_len;
+            if self.eos_at.is_some_and(|e| generated >= e) {
+                return self.eos;
+            }
+            let h = prefix
+                .iter()
+                .fold(0x9E37_79B9u32, |h, &t| h.rotate_left(5).wrapping_mul(0x85EB_CA6B) ^ t as u32);
+            (h % 50) as TokenId + 1
+        }
+        /// Plain greedy decode — the ground truth every driver must reproduce.
+        fn greedy(&self, prompt: &[TokenId], max_new: usize) -> Vec<TokenId> {
+            let mut ctx = prompt.to_vec();
+            let mut out = Vec::new();
+            while out.len() < max_new {
+                let t = self.next(&ctx);
+                if t == self.eos {
+                    break;
+                }
+                out.push(t);
+                ctx.push(t);
+            }
+            out
+        }
+    }
+
+    /// A chain with a position-indexed "KV" (the fed tokens by absolute position). Results are
+    /// computed at submit time from the KV as it stands, like the real FIFO chain — so stale
+    /// post-divergence chunks see stale state and the overwrite-rollback property is exercised.
+    struct KvPipe {
+        oracle: Oracle,
+        kv: Vec<TokenId>,
+        q: VecDeque<Vec<TokenId>>,
+    }
+    impl KvPipe {
+        fn new(oracle: Oracle) -> Self {
+            Self { oracle, kv: Vec::new(), q: VecDeque::new() }
+        }
+        fn feed(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<TokenId> {
+            let start = start_pos as usize;
+            assert!(start <= self.kv.len(), "chunk at {start} leaves a KV gap (len {})", self.kv.len());
+            self.kv.truncate(start);
+            let mut out = Vec::with_capacity(tokens.len());
+            for &t in tokens {
+                self.kv.push(t);
+                out.push(self.oracle.next(&self.kv));
+            }
+            out
+        }
+    }
+    impl PipelinedChain for KvPipe {
+        fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
+            self.q.clear();
+            *self.feed(0, prompt).last().unwrap()
+        }
+        fn submit(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]) {
+            let mut chunk = vec![cur];
+            chunk.extend_from_slice(drafts);
+            let r = self.feed(start_pos, &chunk);
+            self.q.push_back(r);
+        }
+        fn poll(&mut self) -> Vec<TokenId> {
+            self.q.pop_front().expect("poll with no in-flight chunk")
+        }
+        fn truncate(&mut self, _keep_to_pos: u32) {}
+        fn is_eos(&self, token: TokenId) -> bool {
+            token == self.oracle.eos
+        }
+    }
+    impl TargetChain for KvPipe {
+        fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
+            *self.feed(0, prompt).last().unwrap()
+        }
+        fn verify(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
+            let mut chunk = vec![cur];
+            chunk.extend_from_slice(drafts);
+            self.feed(start_pos, &chunk)
+        }
+        fn truncate(&mut self, _keep_to_pos: u32) {}
+        fn is_eos(&self, token: TokenId) -> bool {
+            token == self.oracle.eos
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Quality {
+        /// The target's own greedy continuation (keeps emitting EOS after the end).
+        Perfect,
+        /// Never right.
+        Garbage,
+        /// Right, except one wrong token on every other call.
+        Flaky,
+        /// Right, except the chunk's LAST token is always EOS (the truncation-bug trigger,
+        /// in its wrong-guess form).
+        EosAtChunkEnd,
+        /// Every token is EOS.
+        AllEos,
+    }
+    struct OracleDraft {
+        oracle: Oracle,
+        quality: Quality,
+        calls: usize,
+    }
+    impl DraftEngine for OracleDraft {
+        fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
+            self.calls += 1;
+            let mut ctx = context.to_vec();
+            let mut out = Vec::with_capacity(gamma);
+            for _ in 0..gamma {
+                let t = self.oracle.next(&ctx);
+                out.push(t);
+                ctx.push(t);
+            }
+            match self.quality {
+                Quality::Perfect => {}
+                Quality::Garbage => out.fill(i32::MIN),
+                Quality::Flaky => {
+                    if self.calls % 2 == 0 {
+                        out[self.calls % gamma] = 77; // outside the oracle's 1..=50 range
+                    }
+                }
+                Quality::EosAtChunkEnd => *out.last_mut().unwrap() = self.oracle.eos,
+                Quality::AllEos => out.fill(self.oracle.eos),
+            }
+            out
+        }
+    }
+
+    const QUALITIES: [Quality; 5] =
+        [Quality::Perfect, Quality::Garbage, Quality::Flaky, Quality::EosAtChunkEnd, Quality::AllEos];
+
+    /// Regression: a draft that (correctly) ends a chunk on EOS must not cost the still-in-flight
+    /// chunks. Before the fix, depth >= 3 dropped up to `depth - 1` chunks of valid output.
+    #[test]
+    fn eos_on_a_chunk_boundary_does_not_truncate() {
+        let eos = 9999;
+        let prompt = vec![7, 8];
+        let gamma = 4;
+        for eos_at in 0..=24usize {
+            let oracle = Oracle { prompt_len: prompt.len(), eos_at: Some(eos_at), eos };
+            let expected = oracle.greedy(&prompt, 100);
+            assert_eq!(expected.len(), eos_at);
+            for depth in 1..=8usize {
+                let mut c = KvPipe::new(oracle);
+                let mut d = OracleDraft { oracle, quality: Quality::Perfect, calls: 0 };
+                let cfg = SpecConfig { gamma, max_new: 100 };
+                let (out, _) = run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth);
+                assert_eq!(out, expected, "eos_at={eos_at} depth={depth}");
+            }
+        }
+    }
+
+    /// Regression: a draft that WRONGLY predicts EOS (target keeps going) must neither end
+    /// generation nor stall it.
+    #[test]
+    fn wrong_eos_speculation_does_not_end_generation() {
+        let eos = 9999;
+        let prompt = vec![3];
+        let oracle = Oracle { prompt_len: prompt.len(), eos_at: None, eos };
+        let cfg = SpecConfig { gamma: 4, max_new: 30 };
+        let expected = oracle.greedy(&prompt, cfg.max_new);
+        assert_eq!(expected.len(), 30);
+        for quality in [Quality::EosAtChunkEnd, Quality::AllEos] {
+            for depth in 1..=6usize {
+                let mut c = KvPipe::new(oracle);
+                let mut d = OracleDraft { oracle, quality, calls: 0 };
+                let (out, _) = run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth);
+                assert_eq!(out, expected, "{quality:?} depth={depth}");
+            }
+        }
+    }
+
+    /// The whole grid: gamma x depth x answer length x draft quality. Both drivers must equal
+    /// plain greedy decode, whether generation ends on EOS or on `max_new`.
+    #[test]
+    fn drivers_equal_greedy_across_the_grid() {
+        let eos = 9999;
+        let prompt = vec![11, 12, 13];
+        let max_new = 17;
+        let mut cases = 0usize;
+        for eos_at in (0..=22usize).map(Some).chain([None]) {
+            let oracle = Oracle { prompt_len: prompt.len(), eos_at, eos };
+            let expected = oracle.greedy(&prompt, max_new);
+            for gamma in 1..=5usize {
+                let cfg = SpecConfig { gamma, max_new };
+                for quality in QUALITIES {
+                    let mut t = KvPipe::new(oracle);
+                    let mut d = OracleDraft { oracle, quality, calls: 0 };
+                    let (sync_out, _) = crate::specdecode::run_spec_decode(&mut d, &mut t, &prompt, &cfg);
+                    assert_eq!(sync_out, expected, "sync eos_at={eos_at:?} gamma={gamma} {quality:?}");
+
+                    for depth in 1..=6usize {
+                        let mut c = KvPipe::new(oracle);
+                        let mut d = OracleDraft { oracle, quality, calls: 0 };
+                        let (out, stats) = run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth);
+                        assert_eq!(
+                            out, expected,
+                            "pipelined eos_at={eos_at:?} gamma={gamma} depth={depth} {quality:?}"
+                        );
+                        assert_eq!(stats.committed, out.len());
+                        assert!(c.q.is_empty(), "driver left chunks in flight");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 24 * 5 * 5 * 6);
     }
 }
