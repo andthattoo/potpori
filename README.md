@@ -60,9 +60,10 @@ great), split the layers. Friends start their shards (weights auto-download from
 ```bash
 # friend A (middle)
 potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B --layers 12:24 \
-              --role middle --downstream <friend-B>:4010 --chunk 8
+              --role middle --downstream <friend-B>:4010 --chunk 8 --max-seq 768
 # friend B (tail)
-potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B --layers 24:36 --role tail --chunk 8
+potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B --layers 24:36 --role tail \
+              --chunk 8 --max-seq 768
 ```
 
 Then chat from the head:
@@ -74,6 +75,10 @@ potpori chat --chain chain.toml --prompt "explain speculative decoding in one pa
 First runs are slow to start: weights download once, and Luminal's kernel search compiles each
 shard (~minutes). Generation itself is the fast part.
 
+> `--max-seq` must equal `max_seq` from the chain config (both default to 768, the validated
+> point), and a generation must fit in it: prompt + `--max-new` + `depth × gamma` positions —
+> `potpori chat` checks this up front.
+>
 > `--chunk` must be `gamma + 1` from the chain config. On Metal it's required (the specialized
 > kernel is ~20× faster than the generic multi-token one); on CUDA you can pass `--chunk 0`.
 

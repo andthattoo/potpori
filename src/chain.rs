@@ -7,6 +7,7 @@
 //! downstream address. Discovery/NAT traversal/re-planning come later (see
 //! `docs/chain-formation-design.md`).
 
+use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -50,7 +51,7 @@ fn default_gamma() -> usize {
     7
 }
 fn default_max_seq() -> usize {
-    2048
+    768 // the validated point; `potpori serve --max-seq` defaults to the same value
 }
 fn default_depth() -> usize {
     4
@@ -92,9 +93,37 @@ impl ChainConfig {
         Ok(())
     }
 
+    /// The verify chunk size every shard must be compiled for (`potpori serve --chunk`).
+    pub fn chunk(&self) -> usize {
+        self.gamma + 1
+    }
+
+    /// Check the plan against the target model's layer count (known only once the model is
+    /// resolved, so this is separate from `validate`).
+    pub fn check_layers(&self, model_layers: usize) -> Result<()> {
+        let end = self.nodes.last().expect("validated: non-empty").layers[1];
+        if end != model_layers {
+            bail!(
+                "the last node must end at layer {model_layers} (the tail owns the lm_head of {}), \
+                 but the chain ends at {end}",
+                self.model
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.nodes.len() < 2 {
             bail!("a chain needs at least 2 nodes (a local head + a remote tail)");
+        }
+        if self.gamma == 0 {
+            bail!("gamma must be at least 1");
+        }
+        if self.depth == 0 {
+            bail!("depth must be at least 1");
+        }
+        if self.max_seq <= self.chunk() {
+            bail!("max_seq ({}) must be larger than the verify chunk gamma+1 ({})", self.max_seq, self.chunk());
         }
         if self.nodes[0].layers[0] != 0 {
             bail!("the first node is the head and must start at layer 0");
@@ -110,15 +139,24 @@ impl ChainConfig {
                 );
             }
         }
-        for (i, n) in self.nodes.iter().enumerate().skip(1) {
-            if n.addr.is_none() {
-                bail!("remote node {i} needs an addr");
-            }
+        for (i, n) in self.nodes.iter().enumerate() {
             if n.layers[0] >= n.layers[1] {
-                bail!("node {i} has an empty layer range");
+                bail!("node {i} has an empty layer range [{}, {})", n.layers[0], n.layers[1]);
             }
         }
+        for i in 1..self.nodes.len() {
+            self.remote_addr(i)?;
+        }
         Ok(())
+    }
+
+    /// The socket address of remote node `i` (i >= 1).
+    pub fn remote_addr(&self, i: usize) -> Result<SocketAddr> {
+        let Some(addr) = self.nodes[i].addr.as_deref() else {
+            bail!("remote node {i} needs an addr");
+        };
+        addr.parse()
+            .with_context(|| format!("node {i}: addr {addr:?} must be IP:port, e.g. 100.64.0.2:4010"))
     }
 }
 
@@ -144,8 +182,40 @@ mod tests {
         .unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.gamma, 7);
+        assert_eq!(cfg.chunk(), 8);
+        assert_eq!(cfg.max_seq, 768);
         assert_eq!(cfg.draft_model, "Qwen/Qwen3-0.6B");
         assert_eq!(cfg.nodes.len(), 3);
+        assert_eq!(cfg.remote_addr(2).unwrap(), "100.64.0.3:4010".parse().unwrap());
+        cfg.check_layers(36).unwrap();
+        assert!(cfg.check_layers(28).is_err());
+    }
+
+    fn two_node(extra: &str, head: &str, tail_addr: &str, tail: &str) -> Result<ChainConfig> {
+        let cfg: ChainConfig = toml::from_str(&format!(
+            "model = \"Qwen/Qwen3-4B\"\n{extra}\n[[nodes]]\nlayers = {head}\n[[nodes]]\n{tail_addr}\nlayers = {tail}\n"
+        ))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn rejects_bad_plans() {
+        const ADDR: &str = "addr = \"1.2.3.4:4010\"";
+        two_node("", "[0, 18]", ADDR, "[18, 36]").unwrap();
+        for (what, r) in [
+            ("gamma 0", two_node("gamma = 0", "[0, 18]", ADDR, "[18, 36]")),
+            ("depth 0", two_node("depth = 0", "[0, 18]", ADDR, "[18, 36]")),
+            ("tiny max_seq", two_node("max_seq = 8", "[0, 18]", ADDR, "[18, 36]")),
+            ("empty head", two_node("", "[0, 0]", ADDR, "[0, 36]")),
+            ("empty tail", two_node("", "[0, 36]", ADDR, "[36, 36]")),
+            ("head not at 0", two_node("", "[1, 18]", ADDR, "[18, 36]")),
+            ("missing addr", two_node("", "[0, 18]", "", "[18, 36]")),
+            ("placeholder addr", two_node("", "[0, 18]", "addr = \"MAC2_IP:4010\"", "[18, 36]")),
+            ("addr without port", two_node("", "[0, 18]", "addr = \"1.2.3.4\"", "[18, 36]")),
+        ] {
+            assert!(r.is_err(), "{what} should be rejected");
+        }
     }
 
     #[test]
