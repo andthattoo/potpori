@@ -1,15 +1,10 @@
-//! Node-to-node hidden-state transport for the shard chain.
+//! The wire between adjacent nodes: message types, framing, mutually authenticated QUIC
+//! endpoints, the session handshake, and the middle node's relay.
 //!
-//! The residual-stream hidden state crosses each shard boundary here, over a quinn bi-stream
-//! with length-prefixed msgpack framing ([`read_framed`]/[`write_framed`]).
-//!
-//! This module is the WIRE. [`crate::qwen::shard::ShardedChain`] does the in-process hand-off; a
-//! remote shard replaces that one `Vec<f32>` hop with [`PeerConnection::send`] of a
-//! [`HiddenStateFrame`]. The hidden round-trip is lossless (f32 bytes → msgpack bin → f32).
-//!
-//! NAT traversal / brokered path formation and the activation codec are later (see
-//! `docs/chain-formation-design.md`, `docs/pipeline-specdecode-design.md`).
-#![allow(dead_code)]
+//! One quinn bi-stream per hop carries length-prefixed msgpack ([`read_framed`] /
+//! [`write_framed`]). Hidden states travel downstream, verification results travel back up,
+//! and both stay in submission order. [`crate::node`] builds the head, middle and tail roles
+//! on top of this module.
 
 use std::io;
 use std::net::SocketAddr;
@@ -22,11 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::TokenId;
 
-/// ALPN for node↔node shard streams.
-const ALPN: &[u8] = b"potpori-shard-v2";
+/// Bumped on every incompatible wire change, so mismatched builds fail at the TLS handshake.
+const ALPN: &[u8] = b"potpori-shard-v3";
 
 // ---------------------------------------------------------------------------
-// Length-prefixed msgpack framing (inlined from dkn-protocol's framing.rs)
+// Length-prefixed msgpack framing
 // Wire format: [4-byte BE length][msgpack payload]
 // ---------------------------------------------------------------------------
 
@@ -72,35 +67,29 @@ pub async fn read_framed<T: serde::de::DeserializeOwned>(
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// A residual-stream hidden state crossing a shard boundary: logically `[n_tokens, hidden]`.
-/// Bandwidth is small (~12 KiB/token at H=6144, bf16) — the wire is RTT-bound, not byte-bound —
-/// so the activation codec (`dtype`) is a second-order optimization for thin home uplinks, not
-/// the latency lever. The payload is the row-major hidden state in little-endian `dtype`.
+/// A residual-stream hidden state crossing a shard boundary: logically `[n_tokens, hidden]`,
+/// row-major, little-endian `dtype`. A verification chunk at Qwen3-4B width is about 80 KiB,
+/// so the link is bound by round-trip time, not bandwidth.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HiddenStateFrame {
-    pub request_id: u64,
-    pub chain_id: u64,
-    /// Reserved for future chain re-planning; current sessions use epoch zero.
-    pub epoch: u64,
+    /// Per-session frame counter, echoed in the matching [`VerifyResult`].
     pub step: u64,
-    /// Absolute sequence position of the first token in this chunk (the spec-decode `start_pos`);
-    /// every shard writes its KV at the same absolute positions, which makes rollback a no-op.
+    /// Absolute sequence position of the first token in this chunk. Every shard writes its KV
+    /// at the same absolute positions, so a rejected speculative tail is simply overwritten.
     pub start_pos: u32,
-    /// Which layer-block boundary this hidden state sits at (the cut index).
+    /// The layer boundary this hidden state sits at: the receiving shard's first layer.
     pub layer_boundary: u32,
     pub n_tokens: u32,
     pub hidden_dim: u32,
-    /// Activation codec on the wire, e.g. "f32" | "bf16" | "fp8".
+    /// Activation codec on the wire. Only "f32" is implemented.
     pub dtype: String,
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
 impl HiddenStateFrame {
     /// Build an f32 hidden-state frame from a flat `[n_tokens * hidden_dim]` residual stream.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_f32(
-        request_id: u64,
-        epoch: u64,
         step: u64,
         start_pos: u32,
         layer_boundary: u32,
@@ -109,9 +98,6 @@ impl HiddenStateFrame {
         hidden: &[f32],
     ) -> Self {
         Self {
-            request_id,
-            chain_id: 0,
-            epoch,
             step,
             start_pos,
             layer_boundary,
@@ -122,11 +108,15 @@ impl HiddenStateFrame {
         }
     }
 
-    /// Decode the payload back to a flat f32 residual stream (only `dtype == "f32"` for now).
+    /// Decode the payload back to a flat f32 residual stream.
     pub fn to_f32(&self) -> Vec<f32> {
         assert_eq!(self.dtype, "f32", "only the f32 codec is implemented");
         le_bytes_to_f32(&self.data)
     }
+
+    /// Check an inbound frame against the receiving shard before it reaches the GPU: codec,
+    /// width, boundary, a compiled kernel for the chunk size (`chunk` 0 = any size), cache
+    /// bounds, and finite values.
     pub fn validate(
         &self,
         hidden: usize,
@@ -155,24 +145,17 @@ impl HiddenStateFrame {
     }
 }
 
-/// The tail owns `lm_head` and returns the target's greedy argmax at each verify position.
-/// Intermediate shards relay the result upstream to the head for acceptance checking.
+/// The tail's answer to one [`HiddenStateFrame`]: the target's greedy token at each of its
+/// positions. Middles relay it upstream to the head, which does the acceptance check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerifyResult {
-    pub request_id: u64,
     pub step: u64,
     pub argmax: Vec<TokenId>,
 }
+
 impl VerifyResult {
-    pub fn validate(
-        &self,
-        request_id: u64,
-        step: u64,
-        count: usize,
-        vocab: usize,
-    ) -> io::Result<()> {
-        if self.request_id != request_id
-            || self.step != step
+    pub fn validate(&self, step: u64, count: usize, vocab: usize) -> io::Result<()> {
+        if self.step != step
             || self.argmax.len() != count
             || self.argmax.iter().any(|&t| t < 0 || t as usize >= vocab)
         {
@@ -184,58 +167,108 @@ impl VerifyResult {
     }
 }
 
-/// Roll back every shard's KV to the committed prefix. With absolute-position KV writes this is
-/// advisory (the next chunk overwrites the rejected tail); maps to [`crate::engine::TargetChain::truncate`].
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct KvTruncate {
-    pub request_id: u64,
-    pub epoch: u64,
-    pub keep_to_pos: u32,
-}
-
 /// One framed message on a shard bi-stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PeerMessage {
+    /// Upstream → downstream, first message of a session.
     Hello(SessionHello),
-    Ready { final_layer: usize },
+    /// Downstream → upstream: this node and every node below it accepted the session.
+    Ready {
+        final_layer: usize,
+    },
     Hidden(HiddenStateFrame),
     Result(VerifyResult),
-    Truncate(KvTruncate),
+    /// Downstream → upstream: the session is over, and why. Relayed up to the head.
+    Error(String),
 }
 
+/// What two adjacent nodes must agree on before any activation is exchanged.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionHello {
+    /// Model geometry (layers, widths, heads), so different checkpoints cannot be mixed.
     pub model: String,
+    /// The layer boundary between the two nodes.
     pub next_layer: usize,
     pub max_seq: usize,
     pub chunk: usize,
 }
+
+impl SessionHello {
+    /// Why `got` (the upstream node's hello) does not fit `self` (what this node serves).
+    fn mismatch(&self, got: &SessionHello) -> String {
+        let mut diffs = Vec::new();
+        if got.model != self.model {
+            diffs.push(format!(
+                "model {:?} (this node has {:?})",
+                got.model, self.model
+            ));
+        }
+        if got.next_layer != self.next_layer {
+            diffs.push(format!(
+                "next layer {} (this node starts at {})",
+                got.next_layer, self.next_layer
+            ));
+        }
+        if got.max_seq != self.max_seq {
+            diffs.push(format!(
+                "max_seq {} (this node has {})",
+                got.max_seq, self.max_seq
+            ));
+        }
+        if got.chunk != self.chunk {
+            diffs.push(format!(
+                "chunk {} (this node has {})",
+                got.chunk, self.chunk
+            ));
+        }
+        format!("upstream expects {}", diffs.join(", "))
+    }
+}
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for a peer to read a final message and close.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Open a session with the downstream peer: send `hello`, then wait for it to confirm that
+/// the chain below it is complete up to `final_layer`. A peer that refuses says why.
 pub async fn negotiate(
     peer: &mut PeerConnection,
     hello: SessionHello,
     final_layer: usize,
 ) -> io::Result<()> {
     peer.send(&PeerMessage::Hello(hello)).await?;
-    match tokio::time::timeout(Duration::from_secs(30), peer.recv())
+    // A middle only answers once everything below it has answered, so allow a few hops.
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT * 4, peer.recv())
         .await
-        .map_err(io_other)??
-    {
+        .map_err(|_| {
+            io_other("timed out waiting for the downstream node to accept the session")
+        })?? {
         Some(PeerMessage::Ready { final_layer: got }) if got == final_layer => Ok(()),
-        _ => Err(io_other(
-            "peer did not confirm the complete compatible model chain",
-        )),
+        Some(PeerMessage::Ready { final_layer: got }) => Err(io_other(format!(
+            "the chain ends at layer {got}, but the model has {final_layer}"
+        ))),
+        Some(PeerMessage::Error(why)) => Err(io_other(why)),
+        _ => Err(io_other("downstream node did not complete the handshake")),
     }
 }
-pub async fn receive_hello(peer: &mut PeerConnection, expected: &SessionHello) -> io::Result<()> {
-    match tokio::time::timeout(Duration::from_secs(30), peer.recv())
+
+/// Accept a session from the upstream peer if its hello equals `expected`. On a mismatch the
+/// peer is told which settings differ (prefixed with `who`, this node's name, since the text
+/// is relayed all the way to the head), and the same text is returned as the error.
+pub async fn receive_hello(
+    peer: &mut PeerConnection,
+    expected: &SessionHello,
+    who: &str,
+) -> io::Result<()> {
+    let why = match tokio::time::timeout(HANDSHAKE_TIMEOUT, peer.recv())
         .await
-        .map_err(io_other)??
+        .map_err(|_| io_other("timed out waiting for the upstream node's hello"))??
     {
-        Some(PeerMessage::Hello(got)) if got == *expected => Ok(()),
-        _ => Err(io_other(
-            "peer model, layer boundary, cache capacity, or chunk differs",
-        )),
-    }
+        Some(PeerMessage::Hello(got)) if got == *expected => return Ok(()),
+        Some(PeerMessage::Hello(got)) => expected.mismatch(&got),
+        _ => "expected a session hello first".to_string(),
+    };
+    Err(peer.fail(format!("{who}: {why}")).await)
 }
 
 fn f32_to_le_bytes(xs: &[f32]) -> Vec<u8> {
@@ -259,7 +292,7 @@ fn le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 // Duplex link to one adjacent peer
 // ---------------------------------------------------------------------------
 
-/// A duplex link to an adjacent shard, supporting ordered pipelined requests and results.
+/// A duplex link to an adjacent node, carrying ordered pipelined requests and results.
 pub struct PeerConnection {
     // Held to keep the QUIC connection open: dropping the last Connection handle closes it,
     // even while the stream halves are still alive.
@@ -274,17 +307,25 @@ impl PeerConnection {
     }
 
     pub async fn send(&mut self, msg: &PeerMessage) -> io::Result<()> {
-        write_framed(&mut self.send, msg).await.map_err(io_other)
+        write_framed(&mut self.send, msg).await
     }
 
     /// Read the next message; `Ok(None)` on clean stream EOF.
     pub async fn recv(&mut self) -> io::Result<Option<PeerMessage>> {
-        read_framed(&mut self.recv).await.map_err(io_other)
+        read_framed(&mut self.recv).await
     }
 
-    /// Close this side of the connection (call after the final frame is read). Dropping the
-    /// connection sends an immediate CONNECTION_CLOSE that can discard un-read data, so the
-    /// reader closes explicitly and the writer awaits [`wait_closed`] before tearing down.
+    /// End the session with a reason: tell the peer, give it a moment to read that, and
+    /// return the same reason as this side's error.
+    pub async fn fail(&mut self, why: String) -> io::Error {
+        let _ = self.send(&PeerMessage::Error(why.clone())).await;
+        self.finish();
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.wait_closed()).await;
+        io_other(why)
+    }
+
+    /// Close the connection now, without a goodbye.
+    #[cfg(test)]
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"bye");
     }
@@ -300,13 +341,20 @@ impl PeerConnection {
     pub fn finish(&mut self) {
         let _ = self.send.finish();
     }
-    fn into_parts(self) -> (quinn::Connection, SendStream, RecvStream) {
-        (self.conn, self.send, self.recv)
+
+    /// QUIC's current round-trip estimate to this peer.
+    pub fn rtt(&self) -> Duration {
+        self.conn.rtt()
     }
 }
 
-/// Bounded duplex relay: GPU computation and forwarding proceed independently of result reads.
-/// One closure invocation owns the shard at a time; request/result order remains FIFO.
+/// The middle node's session loop. Work flows downstream and results flow upstream as two
+/// independent halves, so this node starts on the next chunk without waiting for the answer
+/// to the previous one; request/result order stays FIFO and at most 64 results are pending.
+///
+/// `forward` runs this node's shard on one frame. If anything fails — a bad frame, a lost
+/// link, or a [`PeerMessage::Error`] from below — the reason is sent upstream and the
+/// downstream connection is closed, so no node is left waiting in a dead session.
 pub async fn relay_middle<F>(
     up: PeerConnection,
     down: PeerConnection,
@@ -315,44 +363,56 @@ pub async fn relay_middle<F>(
 where
     F: FnMut(HiddenStateFrame) -> io::Result<HiddenStateFrame>,
 {
-    let (_up_conn, mut up_send, mut up_recv) = up.into_parts();
-    let (down_conn, mut down_send, mut down_recv) = down.into_parts();
-    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<(u64, u64, usize)>(64);
+    let PeerConnection {
+        conn: up_conn,
+        send: mut up_send,
+        recv: mut up_recv,
+    } = up;
+    let PeerConnection {
+        conn: down_conn,
+        send: mut down_send,
+        recv: mut down_recv,
+    } = down;
+    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<(u64, usize)>(64);
     let transmit = async {
         while let Some(msg) = read_framed::<PeerMessage>(&mut up_recv).await? {
-            match msg {
-                PeerMessage::Hidden(frame) => {
-                    let expected = (frame.request_id, frame.step, frame.n_tokens as usize);
-                    let out = forward(frame)?;
-                    pending_tx.send(expected).await.map_err(io_other)?;
-                    write_framed(&mut down_send, &PeerMessage::Hidden(out)).await?;
-                }
-                PeerMessage::Truncate(_) => {}
-                _ => return Err(io_other("unexpected message during shard session")),
-            }
+            let PeerMessage::Hidden(frame) = msg else {
+                return Err(io_other("unexpected message during shard session"));
+            };
+            let expected = (frame.step, frame.n_tokens as usize);
+            let out = forward(frame)?;
+            pending_tx.send(expected).await.map_err(io_other)?;
+            write_framed(&mut down_send, &PeerMessage::Hidden(out)).await?;
         }
         down_send.finish().map_err(io_other)?;
         drop(pending_tx);
         io::Result::Ok(())
     };
     let receive = async {
-        while let Some((request_id, step, n)) = pending_rx.recv().await {
+        while let Some((step, n)) = pending_rx.recv().await {
             let result = match read_framed::<PeerMessage>(&mut down_recv).await? {
-                Some(PeerMessage::Result(r))
-                    if r.request_id == request_id && r.step == step && r.argmax.len() == n =>
-                {
-                    r
-                }
+                Some(PeerMessage::Result(r)) if r.step == step && r.argmax.len() == n => r,
+                Some(PeerMessage::Error(why)) => return Err(io_other(why)),
                 _ => return Err(io_other("invalid or missing downstream result")),
             };
             write_framed(&mut up_send, &PeerMessage::Result(result)).await?;
         }
-        up_send.finish().map_err(io_other)?;
         io::Result::Ok(())
     };
-    tokio::try_join!(transmit, receive)?;
-    down_conn.closed().await;
-    Ok(())
+    let outcome = tokio::try_join!(transmit, receive);
+    match &outcome {
+        Ok(_) => {
+            up_send.finish().map_err(io_other)?;
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, down_conn.closed()).await;
+        }
+        Err(e) => {
+            let _ = write_framed(&mut up_send, &PeerMessage::Error(e.to_string())).await;
+            let _ = up_send.finish();
+            down_conn.close(0u32.into(), b"session failed");
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, up_conn.closed()).await;
+        }
+    }
+    outcome.map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +479,9 @@ impl TlsIdentity {
         static ID: std::sync::OnceLock<TlsIdentity> = std::sync::OnceLock::new();
         ID.get_or_init(Self::test_identity).clone()
     }
+    /// A fresh identity that trusts only itself.
     #[cfg(test)]
-    fn test_identity() -> Self {
+    pub fn test_identity() -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert);
         let mut roots = rustls::RootCertStore::empty();
@@ -512,25 +573,23 @@ mod tests {
     #[test]
     fn rejects_invalid_verification_results() {
         let valid = VerifyResult {
-            request_id: 5,
             step: 7,
             argmax: vec![0, 15],
         };
-        valid.validate(5, 7, 2, 16).unwrap();
-        assert!(valid.validate(6, 7, 2, 16).is_err());
-        assert!(valid.validate(5, 8, 2, 16).is_err());
-        assert!(valid.validate(5, 7, 1, 16).is_err());
-        assert!(valid.validate(5, 7, 2, 15).is_err());
+        valid.validate(7, 2, 16).unwrap();
+        assert!(valid.validate(8, 2, 16).is_err());
+        assert!(valid.validate(7, 1, 16).is_err());
+        assert!(valid.validate(7, 2, 15).is_err());
         let invalid = VerifyResult {
             argmax: vec![-1, 1],
             ..valid
         };
-        assert!(invalid.validate(5, 7, 2, 16).is_err());
+        assert!(invalid.validate(7, 2, 16).is_err());
     }
 
     #[test]
     fn rejects_malformed_frames() {
-        let valid = HiddenStateFrame::from_f32(1, 0, 1, 6, 12, 2, 4, &[0.; 8]);
+        let valid = HiddenStateFrame::from_f32(1, 6, 12, 2, 4, &[0.; 8]);
         valid.validate(4, 12, 8, 2).unwrap();
         for case in 0..7 {
             let mut f = valid.clone();
@@ -589,13 +648,19 @@ mod tests {
         };
         let mut wrong = expected.clone();
         wrong.max_seq = 512;
+        // Both sides must learn WHICH setting differs, not just that something does.
         let server_fut = async {
             let mut p = accept(&server).await.unwrap();
-            assert!(receive_hello(&mut p, &expected).await.is_err());
+            let err = receive_hello(&mut p, &expected, "tail")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("max_seq 512 (this node has 768)"), "{err}");
         };
         let client_fut = async {
             let mut p = dial(&client, addr).await.unwrap();
-            assert!(negotiate(&mut p, wrong, 36).await.is_err());
+            let err = negotiate(&mut p, wrong, 36).await.unwrap_err().to_string();
+            assert!(err.contains("tail: upstream expects max_seq 512"), "{err}");
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(server_fut, client_fut);
@@ -625,7 +690,6 @@ mod tests {
             }
             for f in frames {
                 p.send(&PeerMessage::Result(VerifyResult {
-                    request_id: f.request_id,
                     step: f.step,
                     argmax: vec![f.step as i32],
                 }))
@@ -644,8 +708,6 @@ mod tests {
             let mut p = dial(&head, middle_addr).await.unwrap();
             for step in 1..=2 {
                 p.send(&PeerMessage::Hidden(HiddenStateFrame::from_f32(
-                    step,
-                    0,
                     step,
                     step as u32,
                     1,
@@ -699,7 +761,6 @@ mod tests {
                 frame.start_pos as TokenId,
             ];
             peer.send(&PeerMessage::Result(VerifyResult {
-                request_id: frame.request_id,
                 step: frame.step,
                 argmax,
             }))
@@ -708,11 +769,11 @@ mod tests {
             io::Result::Ok(got)
         };
 
-        // Owner peer (node-0): dial, send the hidden state, read the result.
+        // Head: dial, send the hidden state, read the result.
         let client = dial_endpoint(&TlsIdentity::for_tests()).unwrap();
         let client_fut = async {
             let mut peer = dial(&client, addr).await?;
-            let frame = HiddenStateFrame::from_f32(42, 1, 0, 7, 14, 4, 8, &hidden);
+            let frame = HiddenStateFrame::from_f32(42, 7, 14, 4, 8, &hidden);
             peer.send(&PeerMessage::Hidden(frame)).await?;
             let result = match peer.recv().await?.expect("clean EOF before a result") {
                 PeerMessage::Result(r) => r,
@@ -729,11 +790,69 @@ mod tests {
             server_got, hidden_expect,
             "hidden state must survive the QUIC round-trip exactly"
         );
-        assert_eq!(result.request_id, 42);
+        assert_eq!(result.step, 42);
         assert_eq!(
             result.argmax,
             vec![32, 4, 7],
             "n_floats=32, n_tokens=4, start_pos=7"
         );
+    }
+
+    // A failure below a middle must travel up as an Error carrying the reason, and the middle
+    // must close its downstream link so the node below is not left in a dead session.
+    #[tokio::test]
+    async fn middle_relays_a_downstream_error_and_closes_both_sides() {
+        let id = TlsIdentity::for_tests();
+        let tail = listen_endpoint("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+        let middle = listen_endpoint("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+        let head = dial_endpoint(&id).unwrap();
+        let (middle_addr, tail_addr) = (middle.local_addr().unwrap(), tail.local_addr().unwrap());
+        let tail_fut = async {
+            let mut p = accept(&tail).await.unwrap();
+            assert!(matches!(
+                p.recv().await.unwrap(),
+                Some(PeerMessage::Hidden(_))
+            ));
+            let _ = p.fail("tail: out of cache".into()).await;
+        };
+        let middle_fut = async {
+            let up = accept(&middle).await.unwrap();
+            let ep = dial_endpoint(&id).unwrap();
+            let down = dial(&ep, tail_addr).await.unwrap();
+            let err = relay_middle(up, down, Ok).await.unwrap_err().to_string();
+            assert!(err.contains("tail: out of cache"), "{err}");
+        };
+        let head_fut = async {
+            let mut p = dial(&head, middle_addr).await.unwrap();
+            let frame = HiddenStateFrame::from_f32(1, 0, 1, 1, 1, &[0.]);
+            p.send(&PeerMessage::Hidden(frame)).await.unwrap();
+            match p.recv().await.unwrap() {
+                Some(PeerMessage::Error(why)) => assert!(why.contains("tail: out of cache")),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(tail_fut, middle_fut, head_fut);
+        })
+        .await
+        .unwrap();
+    }
+
+    // The payload must travel as one msgpack `bin`. A plain `Vec<u8>` serializes as an array
+    // of integers, which costs up to two bytes per byte.
+    #[test]
+    fn hidden_payload_is_compact_on_the_wire() {
+        let hidden = vec![-1.5f32; 8 * 2560]; // one verification chunk at Qwen3-4B width
+        let frame = PeerMessage::Hidden(HiddenStateFrame::from_f32(1, 0, 18, 8, 2560, &hidden));
+        let bytes = rmp_serde::to_vec(&frame).unwrap();
+        assert!(
+            bytes.len() < hidden.len() * 4 + 64,
+            "{} wire bytes",
+            bytes.len()
+        );
+        match rmp_serde::from_slice(&bytes).unwrap() {
+            PeerMessage::Hidden(f) => assert_eq!(f.to_f32(), hidden),
+            other => panic!("expected Hidden, got {other:?}"),
+        }
     }
 }

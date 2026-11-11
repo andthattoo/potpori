@@ -1,15 +1,19 @@
 //! potpori — sharded LLM inference with your friends over WAN.
 //!
 //! A model is cut into contiguous layer shards; each node serves one shard; the residual-stream
-//! hidden state hops node→node over QUIC. Generation is driven by lossless greedy speculative
-//! decoding (a draft model on the head proposes γ tokens; the chain verifies them in ONE
-//! traversal) with depth-N pipelining to hide WAN RTT. See `docs/` for the design.
+//! hidden state hops node→node over QUIC. Generation is driven by greedy speculative decoding
+//! (a draft model on the head proposes γ tokens; the chain verifies them in one traversal),
+//! with several verification chunks in flight to hide network latency.
 //!
-//! Roles:
-//!   - `potpori serve` — run a middle/tail shard on each friend's box.
-//!   - `potpori chat`  — the head: embeds + first shard + draft model + tokenizer, locally.
+//! Commands:
+//!   - `potpori identity` — create this node's TLS identity.
+//!   - `potpori serve`    — run a middle or tail shard on each friend's machine.
+//!   - `potpori chat`     — the head: tokenizer, first shard and draft model, locally.
+//!
+//! Layout: [`chain`] is the config file, [`transport`] the wire, [`node`] the three roles,
+//! [`specpipe`] / [`specdecode`] the decoding drivers, and `qwen` the model on Luminal.
 
-// Without a backend feature these have no consumer (`run` is compiled out) — don't warn.
+// Without a GPU backend only `identity` runs, so most of the crate has no caller — don't warn.
 #[cfg_attr(
     not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
     allow(dead_code)
@@ -24,33 +28,49 @@ mod engine;
     not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
     allow(dead_code)
 )]
+mod node;
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod specdecode;
 #[cfg_attr(
     not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
     allow(dead_code)
 )]
 mod specpipe;
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod transport;
 
 #[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
 mod qwen;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(clap::Args)]
 struct TlsArgs {
+    /// This node's certificate (share it with adjacent peers).
     #[arg(long, default_value = "identity/cert.pem")]
     cert: PathBuf,
+    /// This node's private key (keep it private).
     #[arg(long, default_value = "identity/key.pem")]
     key: PathBuf,
     /// PEM bundle containing the certificates of trusted peers.
     #[arg(long, default_value = "identity/peers.pem")]
     trust: PathBuf,
 }
+
 impl TlsArgs {
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     fn load(&self) -> Result<transport::TlsIdentity> {
@@ -62,7 +82,7 @@ impl TlsArgs {
 #[command(
     name = "potpori",
     version,
-    about = "Sharded LLM serving with your friends over WAN — pipeline-parallel + lossless speculative decoding on Luminal"
+    about = "Sharded LLM inference with your friends over WAN — pipelined speculative decoding on Luminal"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,7 +96,7 @@ enum Cmd {
         #[arg(long, default_value = "identity")]
         out: PathBuf,
     },
-    /// Serve a shard of the chain (middle or tail) — run this on each friend's box.
+    /// Serve a shard of the chain (middle or tail) — run this on each friend's machine.
     Serve {
         #[command(flatten)]
         tls: TlsArgs,
@@ -87,26 +107,26 @@ enum Cmd {
         #[arg(long)]
         model: String,
         /// Global layer range to serve as start:end, e.g. 12:24
-        #[arg(long)]
-        layers: String,
-        /// Role in the chain: "tail" (last shard, owns the lm_head) or "middle"
-        #[arg(long)]
-        role: String,
+        #[arg(long, value_parser = parse_layers)]
+        layers: (usize, usize),
+        /// Role in the chain: tail (last shard, owns the output projection) or middle
+        #[arg(long, value_enum)]
+        role: Role,
         /// Downstream node address (required for middles)
         #[arg(long)]
         downstream: Option<SocketAddr>,
-        /// Max sequence length — sizes the KV cache (must match the chain config)
+        /// Max sequence length — sizes the KV cache (must equal the chain config's max_seq)
         #[arg(long, default_value_t = 768)]
         max_seq: usize,
-        /// Verify chunk size = γ+1. Compiles a specialized kernel alongside the single-token
-        /// kernel. Must equal the chain's gamma+1; 0 enables generic diagnostic buckets.
+        /// Verification chunk size; must equal the chain's gamma+1. Kernels are compiled for
+        /// exactly 1 and this many tokens. 0 compiles generic kernels (diagnostics only).
         #[arg(long, default_value_t = 8)]
         chunk: usize,
-        /// Egglog search budget per shard load (kernel quality vs startup time)
+        /// Kernel search budget per shard load (kernel quality vs startup time)
         #[arg(long, default_value_t = 200)]
         search_graphs: usize,
     },
-    /// Run the head: prompt in → sharded, spec-decoded generation out.
+    /// Run the head: prompt in → sharded, speculatively decoded generation out.
     Chat {
         #[command(flatten)]
         tls: TlsArgs,
@@ -119,7 +139,30 @@ enum Cmd {
         /// Max new tokens
         #[arg(long, default_value_t = 256)]
         max_new: usize,
+        /// Override the chain config's `depth` (verification chunks in flight) for this run,
+        /// e.g. `--depth 1` vs `--depth 4` to measure what pipelining buys over a link.
+        #[arg(long)]
+        depth: Option<usize>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Role {
+    Middle,
+    Tail,
+}
+
+/// Parse `--layers start:end` into a non-empty global layer range.
+fn parse_layers(s: &str) -> Result<(usize, usize), String> {
+    let (a, b) = s
+        .split_once(':')
+        .ok_or_else(|| "must be start:end, e.g. 12:24".to_string())?;
+    let a: usize = a.trim().parse().map_err(|e| format!("start {a:?}: {e}"))?;
+    let b: usize = b.trim().parse().map_err(|e| format!("end {b:?}: {e}"))?;
+    if a >= b {
+        return Err(format!("empty layer range {a}:{b}"));
+    }
+    Ok((a, b))
 }
 
 fn main() -> Result<()> {
@@ -132,7 +175,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Cmd::Identity { out } = &cli.cmd {
         transport::TlsIdentity::generate(out)?;
-        println!("Identity created in {}. Exchange cert.pem with peers and collect their certificates in peers.pem.", out.display());
+        println!(
+            "Identity created in {}. Exchange cert.pem with adjacent peers and collect their \
+             certificates in peers.pem.",
+            out.display()
+        );
         return Ok(());
     }
 
@@ -154,22 +201,23 @@ fn main() -> Result<()> {
 mod run {
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, bail, Result};
 
     use crate::chain::ChainConfig;
-    use crate::qwen::config_for;
-    use crate::qwen::distributed::{serve_middle_authenticated, serve_tail, PipelinedQuicChain};
+    use crate::node::{serve_middle, serve_tail, ChainLink, ShardEngine as _};
     use crate::qwen::draft::IncrementalDraft;
-    use crate::qwen::hf::prepare_hf_model;
+    use crate::qwen::hf::{prepare_hf_model, COMBINED_WEIGHTS_FILE};
     use crate::qwen::model::QwenConfig;
     use crate::qwen::shard::Shard;
     use crate::qwen::target::QwenTarget;
     use crate::qwen::tok::ChatTokenizer;
+    use crate::qwen::{config_for, EOS_TOKENS};
     use crate::specdecode::SpecConfig;
     use crate::specpipe::run_spec_decode_pipelined;
-    use crate::transport::listen_endpoint;
-    use crate::Cmd;
+    use crate::transport::{listen_endpoint, TlsIdentity};
+    use crate::{Cmd, Role};
 
     // Backend selection: CUDA wins if both features are enabled.
     #[cfg(feature = "cuda")]
@@ -177,15 +225,17 @@ mod run {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     type Backend = crate::qwen::runtime::MetalRuntime;
 
+    const BACKEND: &str = if cfg!(feature = "cuda") {
+        "cuda"
+    } else {
+        "metal"
+    };
+
+    /// How long the head keeps retrying a node that does not answer yet (still loading).
+    const CONNECT_WAIT: Duration = Duration::from_secs(15 * 60);
+
     fn new_runtime() -> Backend {
-        #[cfg(feature = "cuda")]
-        {
-            crate::qwen::runtime::CudaRuntime::new().expect("init CUDA runtime")
-        }
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        {
-            crate::qwen::runtime::MetalRuntime::initialize(())
-        }
+        Backend::default()
     }
 
     pub fn dispatch(cmd: Cmd) -> Result<()> {
@@ -215,82 +265,72 @@ mod run {
                 chain,
                 prompt,
                 max_new,
+                depth,
                 tls,
-            } => chat(chain, prompt, max_new, tls.load()?),
+            } => chat(chain, prompt, max_new, depth, tls.load()?),
             Cmd::Identity { .. } => unreachable!("handled before backend dispatch"),
         }
     }
 
-    /// Resolve a known Qwen config + prepared (downloaded/combined) weights path.
-    fn weights_for(repo: &str) -> Result<(QwenConfig, String)> {
-        let cfg = config_for(repo)
-            .ok_or_else(|| anyhow!("unknown model {repo} — known: Qwen/Qwen3-{{0.6B,1.7B,4B}}"))?;
-        tracing::info!("preparing weights for {repo} (downloads + combines on first run)…");
-        let dir = prepare_hf_model(repo).map_err(|e| anyhow!("prepare {repo}: {e}"))?;
-        Ok((
-            cfg,
-            dir.join("model_combined_bf16_v1.safetensors")
-                .to_string_lossy()
-                .into_owned(),
-        ))
+    fn known_config(repo: &str) -> Result<QwenConfig> {
+        config_for(repo)
+            .ok_or_else(|| anyhow!("unknown model {repo} — known: Qwen/Qwen3-{{0.6B,1.7B,4B}}"))
     }
 
-    fn parse_layers(s: &str) -> Result<(usize, usize)> {
-        let (a, b) = s
-            .split_once(':')
-            .ok_or_else(|| anyhow!("--layers must be start:end, e.g. 12:24"))?;
-        Ok((a.trim().parse()?, b.trim().parse()?))
+    /// Download and prepare `repo`'s weights (first run only); return the prepared file's path.
+    fn weights_for(repo: &str) -> Result<String> {
+        tracing::info!("preparing weights for {repo} (downloads + combines on first run)…");
+        let dir = prepare_hf_model(repo).map_err(|e| anyhow!("prepare {repo}: {e}"))?;
+        Ok(dir
+            .join(COMBINED_WEIGHTS_FILE)
+            .to_string_lossy()
+            .into_owned())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn serve(
         listen: SocketAddr,
         model: String,
-        layers: String,
-        role: String,
+        (a, b): (usize, usize),
+        role: Role,
         downstream: Option<SocketAddr>,
         max_seq: usize,
         chunk: usize,
         search_graphs: usize,
-        tls: crate::transport::TlsIdentity,
+        tls: TlsIdentity,
     ) -> Result<()> {
-        let (a, b) = parse_layers(&layers)?;
-        let is_last = match role.as_str() {
-            "tail" => true,
-            "middle" => false,
-            r => bail!("--role must be tail or middle, got {r}"),
-        };
-        let cfg = config_for(&model).ok_or_else(|| anyhow!("unsupported model {model}"))?;
-        if a >= b
-            || b > cfg.layers
-            || max_seq == 0
-            || max_seq > i32::MAX as usize
-            || chunk > max_seq
-            || search_graphs == 0
-        {
-            bail!("invalid layer range, cache size, chunk, or search budget");
-        }
+        // Validate everything cheap before the download and kernel search.
+        let cfg = known_config(&model)?;
         if a == 0 {
             bail!("layer 0 belongs to the head — run `potpori chat` on the head instead");
         }
-        if is_last && b != cfg.layers {
-            bail!("tail must end at the last layer ({}), got {b}", cfg.layers);
+        if b > cfg.layers {
+            bail!("{model} has {} layers, got --layers {a}:{b}", cfg.layers);
         }
-        if !is_last && downstream.is_none() {
-            bail!("--downstream is required for middles");
+        if max_seq == 0 || max_seq > i32::MAX as usize || chunk > max_seq || search_graphs == 0 {
+            bail!("invalid --max-seq, --chunk or --search-graphs");
         }
-        if !is_last && b == cfg.layers {
-            bail!("middle cannot own the final model layer");
+        match (role, downstream) {
+            (Role::Tail, None) if b == cfg.layers => {}
+            (Role::Tail, None) => bail!("the tail must end at the last layer ({})", cfg.layers),
+            (Role::Tail, Some(_)) => bail!("--downstream is only for middles"),
+            (Role::Middle, Some(_)) if b < cfg.layers => {}
+            (Role::Middle, Some(_)) => {
+                bail!("a middle cannot own the final layer — use --role tail")
+            }
+            (Role::Middle, None) => bail!("--downstream is required for middles"),
         }
-        let (_, wp) = weights_for(&model)?;
+        let wp = weights_for(&model)?;
 
-        tracing::info!("loading shard [{a},{b}) of {model} — egglog kernel search, takes minutes…");
+        tracing::info!(
+            "loading shard [{a},{b}) of {model} on {BACKEND} — kernel search, takes minutes…"
+        );
         let mut shard = Shard::load_chunked(
             new_runtime(),
             cfg,
             (a, b),
             false,
-            is_last,
+            role == Role::Tail,
             &wp,
             max_seq,
             search_graphs,
@@ -304,17 +344,16 @@ mod run {
             let _g = rt.enter();
             listen_endpoint(listen, &tls).map_err(|e| anyhow!("listen on {listen}: {e}"))?
         };
-        tracing::info!("shard ready — serving [{a},{b}) as {role} on {listen}");
+        tracing::info!("shard ready — serving [{a},{b}) as {role:?} on {listen}");
         loop {
-            shard.reset(); // fresh KV per session (absolute-position writes make this belt-and-braces)
-            let res = if is_last {
-                serve_tail(&mut shard, &ep, &rt)
-            } else {
-                serve_middle_authenticated(&mut shard, &ep, downstream.unwrap(), &rt, &tls)
+            shard.reset(); // fresh KV per session
+            let res = match downstream {
+                None => serve_tail(&mut shard, &ep, &rt),
+                Some(next) => serve_middle(&mut shard, &ep, next, &rt, &tls),
             };
             match res {
                 Ok(()) => tracing::info!("session ended cleanly — waiting for the next head"),
-                Err(e) => tracing::warn!("session error: {e} — waiting for the next head"),
+                Err(e) => tracing::warn!("session ended: {e} — waiting for the next head"),
             }
         }
     }
@@ -323,15 +362,20 @@ mod run {
         chain_path: PathBuf,
         prompt: String,
         max_new: usize,
-        tls: crate::transport::TlsIdentity,
+        depth: Option<usize>,
+        tls: TlsIdentity,
     ) -> Result<()> {
         let cc = ChainConfig::load(&chain_path)?;
         let chunk = cc.gamma + 1;
+        let depth = depth.unwrap_or(cc.depth);
+        if depth == 0 || depth > 64 {
+            bail!("--depth must be between 1 and 64");
+        }
         if max_new == 0 {
             return Ok(());
         }
 
-        // Tokenize first (fast) so config errors surface before the slow loads.
+        // Tokenize first (fast) so a request that cannot fit fails before the slow loads.
         let tok = ChatTokenizer::load(&cc.model)?;
         let ids = tok.encode_chat(&prompt)?;
         if ids
@@ -339,45 +383,49 @@ mod run {
             .checked_add(max_new)
             .is_none_or(|n| n > cc.max_seq)
         {
-            bail!("prompt ({} tokens) plus --max-new {max_new} exceeds max_seq {}; shorten the request or increase the cache", ids.len(), cc.max_seq);
+            bail!(
+                "prompt ({} tokens) plus --max-new {max_new} exceeds max_seq {}; shorten the \
+                 request or raise max_seq on every node",
+                ids.len(),
+                cc.max_seq
+            );
         }
 
-        let (dcfg, dwp) = weights_for(&cc.draft_model)?;
-        tracing::info!("loading draft model {}…", cc.draft_model);
+        tracing::info!("loading draft model {} on {BACKEND}…", cc.draft_model);
         let draft_target = QwenTarget::load_chunked(
             new_runtime(),
-            dcfg,
-            &dwp,
+            known_config(&cc.draft_model)?,
+            &weights_for(&cc.draft_model)?,
             cc.max_seq,
             cc.search_graphs,
-            chunk, // point buckets {1, γ+1}, shared by draft, head and remote shards
+            chunk, // kernels for {1, γ+1} tokens, as on the head and the remote shards
         );
+        let mut draft = IncrementalDraft::new(draft_target, chunk);
 
-        let (tcfg, twp) = weights_for(&cc.model)?;
         let head_range = (cc.nodes[0].layers[0], cc.nodes[0].layers[1]);
         tracing::info!(
-            "loading head shard [{},{}) of {} — egglog kernel search, takes minutes…",
+            "loading head shard [{},{}) of {} — kernel search, takes minutes…",
             head_range.0,
             head_range.1,
             cc.model
         );
         let head = Shard::load_chunked(
             new_runtime(),
-            tcfg,
+            known_config(&cc.model)?,
             head_range,
             true,
             false,
-            &twp,
+            &weights_for(&cc.model)?,
             cc.max_seq,
             cc.search_graphs,
             chunk,
         );
-        let mut draft = IncrementalDraft::new(draft_target, chunk);
         {
-            // Argmax now rejects non-finite logits directly; token zero is a valid prediction.
+            // Feeds the prompt into the draft's KV (not wasted work) and fails here, rather
+            // than mid-generation, if the draft's kernels produce non-finite logits.
             use crate::engine::DraftEngine as _;
             let probe = draft.draft(&ids, 1);
-            tracing::info!("draft sanity check ok (first prediction = {})", probe[0]);
+            tracing::info!("draft model ready (first prediction = {})", probe[0]);
         }
 
         let next_addr: SocketAddr = cc.nodes[1]
@@ -385,13 +433,16 @@ mod run {
             .as_ref()
             .expect("validated: remote nodes have addrs")
             .parse()?;
-        tracing::info!("prompt = {} tokens; dialing {next_addr}…", ids.len());
-        let mut chain = PipelinedQuicChain::connect_authenticated(vec![head], next_addr, &tls)
-            .map_err(|e| anyhow!("dial {next_addr}: {e}"))?;
-        chain.set_prefill_chunk(chunk);
+        tracing::info!("prompt = {} tokens; connecting to {next_addr}…", ids.len());
+        let mut chain = ChainLink::connect(head, next_addr, &tls, &EOS_TOKENS, CONNECT_WAIT)?;
+        let rtt_at_connect = chain.rtt();
+        tracing::info!(
+            "chain ready — round trip to the next node {:.1} ms",
+            rtt_at_connect.as_secs_f64() * 1e3
+        );
 
-        let t0 = std::time::Instant::now();
-        let (out, stats) = run_spec_decode_pipelined(
+        let t0 = Instant::now();
+        let generated = run_spec_decode_pipelined(
             &mut draft,
             &mut chain,
             &ids,
@@ -399,22 +450,98 @@ mod run {
                 gamma: cc.gamma,
                 max_new,
             },
-            cc.depth,
+            depth,
         );
         let dt = t0.elapsed().as_secs_f64();
         chain.shutdown();
+        let (out, stats) = generated?;
 
         println!("\n{}", tok.decode(&out)?);
+        let link = chain.stats();
+        let secs = |d: Duration| d.as_secs_f64();
+        let after_prefill = (dt - secs(link.prefill)).max(1e-9);
         eprintln!(
-            "\n[{} tokens in {:.1}s = {:.1} tok/s | {:.2} tok/traversal | γ={} depth={} chain={} nodes]",
+            "\n[{} tokens in {dt:.1}s = {:.1} tok/s overall, {:.1} tok/s after prefill | {:.2} \
+             tok/traversal over {} traversals | γ={} depth={depth} chain={} nodes]",
             out.len(),
-            dt,
             out.len() as f64 / dt,
+            out.len() as f64 / after_prefill,
             stats.toks_per_traversal(),
+            stats.traversals,
             cc.gamma,
-            cc.depth,
             cc.nodes.len(),
         );
+        eprintln!(
+            "[time: prefill {:.2}s ({} prompt tokens) | head shard {:.2}s | waiting on chain \
+             {:.2}s | draft + rest {:.2}s]",
+            secs(link.prefill),
+            ids.len(),
+            secs(link.head_compute),
+            secs(link.waiting),
+            (after_prefill - secs(link.head_compute) - secs(link.waiting)).max(0.0),
+        );
+        eprintln!(
+            "[link: round trip {:.1} ms at connect, {:.1} ms now | {} frames, {:.1} KiB each | \
+             head on {BACKEND}]",
+            secs(rtt_at_connect) * 1e3,
+            secs(chain.rtt()) * 1e3,
+            link.frames,
+            link.payload_bytes as f64 / link.frames.max(1) as f64 / 1024.0,
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn layers_parse() {
+        assert_eq!(parse_layers("12:24"), Ok((12, 24)));
+        assert_eq!(parse_layers(" 0 : 1 "), Ok((0, 1)));
+        for bad in ["12", "12-24", "24:12", "5:5", "a:3", "3:", ":"] {
+            assert!(parse_layers(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn serve_defaults_match_the_chain_config_defaults() {
+        let serve = |extra: &[&str]| {
+            let mut args = vec![
+                "potpori",
+                "serve",
+                "--listen",
+                "0.0.0.0:4010",
+                "--model",
+                "Qwen/Qwen3-4B",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let chain: chain::ChainConfig =
+            toml::from_str(include_str!("../chain.example.toml")).unwrap();
+        match serve(&["--layers", "24:36", "--role", "tail"]).unwrap().cmd {
+            Cmd::Serve {
+                layers,
+                role,
+                max_seq,
+                chunk,
+                ..
+            } => {
+                assert_eq!((layers, role), ((24, 36), Role::Tail));
+                assert_eq!(max_seq, chain.max_seq);
+                assert_eq!(chunk, chain.gamma + 1);
+            }
+            _ => panic!("expected serve"),
+        }
+        assert!(serve(&["--layers", "24:36", "--role", "head"]).is_err());
+        assert!(serve(&["--layers", "36:24", "--role", "tail"]).is_err());
     }
 }

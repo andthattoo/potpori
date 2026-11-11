@@ -5,9 +5,8 @@ use luminal::prelude::*;
 use luminal::shape::SymbolBounds;
 use luminal_nn::{AttentionGeometry, CacheAccess, KvCache};
 
-/// Qwen3 model configuration. Parameterized so a small draft (0.6B) and a bigger target
-/// (1.7B/4B) can both load from this one module — and so the GLM-5.2 port can follow the
-/// same shape with its own config.
+/// Qwen3 model configuration. Parameterized so the small draft (0.6B) and the bigger targets
+/// (1.7B, 4B) load from this one module.
 #[derive(Clone, Copy, Debug)]
 pub struct QwenConfig {
     pub layers: usize,
@@ -28,6 +27,7 @@ impl QwenConfig {
     pub fn kv_dim(&self) -> usize {
         self.n_kv_heads * self.head_dim
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_groups(&self) -> usize {
         self.n_heads / self.n_kv_heads
     }
@@ -71,6 +71,7 @@ impl QwenConfig {
 pub enum TensorData {
     F32(Vec<f32>),
     BF16(Vec<u16>),
+    #[allow(dead_code)] // accepted by the adapters; no current graph uses it
     F16(Vec<u16>),
     I32(Vec<i32>),
 }
@@ -347,6 +348,8 @@ impl QwenGraph {
     }
 }
 
+/// What the kernel search chose for one compiled bucket (kept by the adapters as a report).
+#[allow(dead_code)]
 pub struct BucketPlan<P, O> {
     pub ranges: std::collections::BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,

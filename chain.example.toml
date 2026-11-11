@@ -16,7 +16,7 @@ model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for n
 draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
 gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
 max_seq = 768                     # KV size on every shard; prompt + max_new must fit
-depth = 4                         # in-flight verify chunks (pipelining; hides WAN RTT)
+depth = 4                         # verification chunks in flight (`chat --depth` overrides)
 
 [[nodes]]          # head — this machine (potpori chat)
 layers = [0, 12]

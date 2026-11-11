@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "Sharded LLM inference with your friends over WAN — pipeline-parallel + lossless speculative decoding on Luminal"
+description = "Sharded LLM inference with your friends over WAN — pipelined speculative decoding on Luminal"
 repository = "https://github.com/andthattoo/potpori"
 
 [[bin]]
@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+serde_bytes = "0.11"
 toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
@@ -53,7 +54,6 @@ luminal_cuda_lite = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb
 luminal_nn = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
 cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
 tempfile = { version = "3", optional = true }
-
 
 # Model weight loading + tokenizer, behind the `engine` feature.
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"], optional = true }

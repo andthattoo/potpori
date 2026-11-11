@@ -147,6 +147,7 @@ fn reference_logits(
 #[ignore = "requires a CUDA GPU, NVRTC and cuBLAS"]
 fn native_cuda_tiny_shards_and_rollback() {
     use super::{model::QwenGraph, shard::Shard};
+    use crate::node::ShardEngine as _;
     use safetensors::{tensor::TensorView, Dtype};
     let cfg = QwenConfig {
         layers: 2,
@@ -219,19 +220,10 @@ fn native_cuda_tiny_shards_and_rollback() {
     let path = dir.path().join("tiny.safetensors");
     std::fs::write(&path, safetensors::serialize(views, None).unwrap()).unwrap();
     let wp = path.to_str().unwrap();
-    let mut full = Shard::load_chunked(
-        CudaRuntime::new().unwrap(),
-        cfg,
-        (0, 2),
-        true,
-        true,
-        wp,
-        8,
-        8,
-        2,
-    );
+    let mut full =
+        Shard::load_chunked(CudaRuntime::default(), cfg, (0, 2), true, true, wp, 8, 8, 2);
     let mut head = Shard::load_chunked(
-        CudaRuntime::new().unwrap(),
+        CudaRuntime::default(),
         cfg,
         (0, 1),
         true,
@@ -242,7 +234,7 @@ fn native_cuda_tiny_shards_and_rollback() {
         2,
     );
     let mut tail = Shard::load_chunked(
-        CudaRuntime::new().unwrap(),
+        CudaRuntime::default(),
         cfg,
         (1, 2),
         false,
@@ -310,9 +302,9 @@ fn verify_ms(
 #[ignore]
 fn cuda_substrate_check() {
     let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("download/prepare Qwen3-0.6B");
-    let weights = dir.join("model_combined_bf16_v1.safetensors");
+    let weights = dir.join(super::hf::COMBINED_WEIGHTS_FILE);
     // (1) Build + run: if we get past load(), Luminal CUDA + NVRTC works.
-    let rt = CudaRuntime::new().expect("init CUDA runtime (toolkit + driver present?)");
+    let rt = CudaRuntime::default();
     let mut t = QwenTarget::load(
         rt,
         QwenConfig::QWEN3_0_6B,
@@ -351,8 +343,8 @@ fn cuda_substrate_check() {
     let ratio = ms8 / ms1.max(1e-6);
     println!("[CUDA] generic-bucket forward (ctx~{pos}): s=1 {ms1:.1} ms | s=8 {ms8:.1} ms | ratio {ratio:.1}×");
     if ratio > 3.0 {
-        println!("[CUDA] => CLIFF EXISTS on CUDA too → Shard::load_chunked (specialized bucket) is needed in production (already implemented).");
+        println!("[CUDA] => the generic multi-token kernel is slow here; chunk-specialized kernels (--chunk) matter.");
     } else {
-        println!("[CUDA] => NO cliff on CUDA → the generic multi-token kernel is fine; the s≥2 slowdown is Metal-only. load_chunked is not needed for the CUDA lane.");
+        println!("[CUDA] => the generic multi-token kernel scales normally here.");
     }
 }

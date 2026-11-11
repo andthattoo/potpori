@@ -1,26 +1,28 @@
+//! Weight download and preparation.
+//!
+//! A model's Hugging Face safetensors files are combined once into a single prepared file
+//! ([`COMBINED_WEIGHTS_FILE`], next to the download in the HF cache): matrices as BF16, norm
+//! weights as F32. Each shard then loads only its own parameters from that file.
+
 use half::{bf16, f16};
 use hf_hub::api::sync::Api;
 use memmap2::MmapOptions;
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use safetensors::{tensor::TensorView, Dtype, SafeTensors, View};
 use serde::Deserialize;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::File,
-    io::Write,
     path::{Path, PathBuf},
 };
+
+/// File name of the prepared weights inside the model's HF snapshot directory.
+pub const COMBINED_WEIGHTS_FILE: &str = "model_combined_bf16_v1.safetensors";
 
 /// Index file structure for sharded safetensors models
 #[derive(Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
-}
-
-/// Stored tensor data with shape, dtype, and serialized bytes.
-struct StoredTensor {
-    shape: Vec<usize>,
-    dtype: Dtype,
-    data: Vec<u8>,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -88,20 +90,44 @@ fn keep_f32_in_bf16_pipeline(name: &str) -> bool {
     name.contains("norm")
 }
 
-fn stored_tensor_bf16(name: &str, tensor: &safetensors::tensor::TensorView) -> StoredTensor {
-    let shape = tensor.shape().to_vec();
-    if keep_f32_in_bf16_pipeline(name) {
-        StoredTensor {
-            shape,
-            dtype: Dtype::F32,
-            data: tensor_to_f32_bytes(tensor),
+/// A source tensor re-encoded for the prepared file, lazily: `data()` converts on demand, so
+/// the writer streams one tensor at a time from the memory-mapped downloads and peak memory
+/// is a single tensor rather than the whole model.
+struct CombinedTensor<'a> {
+    src: TensorView<'a>,
+    dtype: Dtype,
+}
+
+impl<'a> CombinedTensor<'a> {
+    fn new(name: &str, src: TensorView<'a>) -> Self {
+        let dtype = if keep_f32_in_bf16_pipeline(name) {
+            Dtype::F32
+        } else {
+            Dtype::BF16
+        };
+        Self { src, dtype }
+    }
+}
+
+impl View for CombinedTensor<'_> {
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    fn shape(&self) -> &[usize] {
+        self.src.shape()
+    }
+    fn data(&self) -> Cow<'_, [u8]> {
+        if self.src.dtype() == self.dtype {
+            Cow::Borrowed(self.src.data())
+        } else if self.dtype == Dtype::F32 {
+            Cow::Owned(tensor_to_f32_bytes(&self.src))
+        } else {
+            Cow::Owned(tensor_to_bf16_bytes(&self.src))
         }
-    } else {
-        StoredTensor {
-            shape,
-            dtype: Dtype::BF16,
-            data: tensor_to_bf16_bytes(tensor),
-        }
+    }
+    fn data_len(&self) -> usize {
+        let elements: usize = self.src.shape().iter().product();
+        elements * if self.dtype == Dtype::F32 { 4 } else { 2 }
     }
 }
 
@@ -125,69 +151,67 @@ fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::erro
     }
 }
 
-/// Combines sharded safetensors into a single bf16 file (norm weights kept
-/// F32). Linear projections, the token embedding and the lm_head are bf16; the
-/// graph explicitly converts checkpoint storage to F32 arithmetic.
+/// Combine the downloaded safetensors files into the single prepared file (matrices BF16,
+/// norm weights F32; the graph converts to F32 arithmetic explicitly). A complete prepared
+/// file from an earlier run is reused.
 ///
-/// Qwen3-4B ties the lm_head to the embedding table, so no separate
-/// `lm_head.weight` is stored — the model reuses `model.embed_tokens.weight`.
+/// Qwen3 ties the output projection to the embedding table, so no separate `lm_head.weight`
+/// is stored — the model reuses `model.embed_tokens.weight`.
 pub fn combine_safetensors_to_bf16(
     model_dir: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
+    let output_path = model_dir.join(COMBINED_WEIGHTS_FILE);
 
     if valid_combined_file(&output_path) {
-        let existing_bytes = std::fs::metadata(&output_path)?.len();
-        println!(
-            "Using existing combined BF16 model at {} ({})",
+        tracing::info!(
+            "using prepared weights at {} ({})",
             output_path.display(),
-            format_bytes(existing_bytes)
+            format_bytes(std::fs::metadata(&output_path)?.len())
         );
         return Ok(output_path);
     }
 
+    // Keep every downloaded file mapped while writing; the tensors below borrow from them.
     let shard_files = model_shard_files(model_dir)?;
-    println!(
-        "Loading {} shard files (converting to BF16, norms F32)...",
-        shard_files.len()
-    );
-
-    let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
-
+    let mut mmaps = Vec::with_capacity(shard_files.len());
     for shard_path in &shard_files {
-        println!(
-            "  Loading {}...",
-            shard_path.file_name().unwrap().to_string_lossy()
-        );
         let file = File::open(shard_path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let st = SafeTensors::deserialize(&mmap)?;
-
+        // SAFETY: files in the HF cache are not modified while this process reads them.
+        mmaps.push(unsafe { MmapOptions::new().map(&file)? });
+    }
+    let sources = mmaps
+        .iter()
+        .map(|m| SafeTensors::deserialize(m))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tensors: HashMap<String, CombinedTensor<'_>> = HashMap::new();
+    for st in &sources {
         for name in st.names() {
-            let tensor = st.tensor(name)?;
-            all_tensors.insert(name.to_string(), stored_tensor_bf16(name, &tensor));
+            tensors.insert(
+                name.to_string(),
+                CombinedTensor::new(name, st.tensor(name)?),
+            );
         }
     }
+    let total: usize = tensors.values().map(|t| t.data_len()).sum();
+    tracing::info!(
+        "preparing weights: {} tensors from {} file(s), {} → {}",
+        tensors.len(),
+        shard_files.len(),
+        format_bytes(total as u64),
+        output_path.display()
+    );
 
-    println!("Extracted {} tensors", all_tensors.len());
-    println!("Saving combined BF16 model to {}...", output_path.display());
-
-    let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
-        .iter()
-        .map(|(name, stored)| {
-            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
-            (name.clone(), view)
-        })
-        .collect();
-
-    let serialized = safetensors::serialize(&tensor_views, None)?;
-
-    publish_atomic(&output_path, &serialized)?;
-
-    println!("Combined BF16 model saved successfully!");
+    // Write under a temporary name and rename: an interrupted run must never leave a
+    // truncated file under the final name.
+    let temp = tempfile::NamedTempFile::new_in(model_dir)?;
+    safetensors::serialize_to_file(tensors, None, temp.path())?;
+    File::open(temp.path())?.sync_all()?;
+    temp.persist(&output_path).map_err(|e| e.error)?;
     Ok(output_path)
 }
 
+/// Whether `path` is a complete safetensors file: the header parses and the tensor offsets
+/// cover the file exactly.
 fn valid_combined_file(path: &Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
@@ -197,14 +221,6 @@ fn valid_combined_file(path: &Path) -> bool {
         return false;
     };
     SafeTensors::deserialize(&mmap).is_ok_and(|st| !st.is_empty())
-}
-
-fn publish_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
 }
 
 /// Load only this shard's declared parameter ports. Byte decoding does not assume mmap alignment.
@@ -250,12 +266,15 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
     // Download tokenizer
     let tokenizer_path = repo.get("tokenizer.json")?;
     let model_dir = tokenizer_path.parent().unwrap().to_path_buf();
-    // Try to download single shard model first
-    if repo.get("model.safetensors").is_ok() {
-        return Ok(model_dir);
-    }
-    // Otherwise download sharded model
-    let index_path = repo.get("model.safetensors.index.json")?;
+    // Repos split across several files have an index; single-file repos do not. Only a
+    // missing index means "single file": a failed weight download must surface as itself.
+    let index_path = match repo.get("model.safetensors.index.json") {
+        Ok(path) => path,
+        Err(_) => {
+            repo.get("model.safetensors")?;
+            return Ok(model_dir);
+        }
+    };
     // Parse index to find shard files
     let index_content = std::fs::read_to_string(&index_path)?;
     let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
@@ -274,7 +293,7 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
 ///
 /// Returns the path to the model directory containing:
 /// - tokenizer.json
-/// - model_combined_bf16_v1.safetensors
+/// - [`COMBINED_WEIGHTS_FILE`]
 pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let model_dir = download_hf_model(repo_id)?;
     combine_safetensors_to_bf16(&model_dir)?;
@@ -284,17 +303,93 @@ pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_bytes(xs: &[f32]) -> Vec<u8> {
+        xs.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// Write a fake model split across two files (F32 and BF16 sources, one norm weight).
+    fn fake_model(dir: &Path) {
+        let w0 = f32_bytes(&[1.0, -2.5, 0.125, 3.0]);
+        let norm = f32_bytes(&[0.5, 1.5]);
+        let w1: Vec<u8> = [4.0f32, -8.0]
+            .iter()
+            .flat_map(|&x| bf16::from_f32(x).to_le_bytes())
+            .collect();
+        let view = |dtype, shape: &[usize], data| TensorView::new(dtype, shape.to_vec(), data);
+        let a = [
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                view(Dtype::F32, &[2, 2], &w0).unwrap(),
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                view(Dtype::F32, &[2], &norm).unwrap(),
+            ),
+        ];
+        let b = [(
+            "model.layers.1.mlp.up_proj.weight",
+            view(Dtype::BF16, &[2], &w1).unwrap(),
+        )];
+        safetensors::serialize_to_file(a, None, &dir.join("model-00001-of-00002.safetensors"))
+            .unwrap();
+        safetensors::serialize_to_file(b, None, &dir.join("model-00002-of-00002.safetensors"))
+            .unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map": {
+                "model.layers.0.mlp.up_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.0.input_layernorm.weight": "model-00001-of-00002.safetensors",
+                "model.layers.1.mlp.up_proj.weight": "model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn atomic_publish_replaces_corrupt_cache() {
+    fn combine_converts_dtypes_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("combined.safetensors");
-        std::fs::write(&path, b"interrupted").unwrap();
-        assert!(!valid_combined_file(&path));
-        let data = 1f32.to_le_bytes();
-        let view = TensorView::new(Dtype::F32, vec![1], &data).unwrap();
-        let bytes = safetensors::serialize([("weight", view)], None).unwrap();
-        publish_atomic(&path, &bytes).unwrap();
-        assert!(valid_combined_file(&path));
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        fake_model(dir.path());
+        let out = combine_safetensors_to_bf16(dir.path()).unwrap();
+        assert_eq!(out, dir.path().join(COMBINED_WEIGHTS_FILE));
+
+        let bytes = std::fs::read(&out).unwrap();
+        let st = SafeTensors::deserialize(&bytes).unwrap();
+        assert_eq!(st.names().len(), 3);
+        // F32 matrix → BF16 (these values are exactly representable).
+        let up0 = st.tensor("model.layers.0.mlp.up_proj.weight").unwrap();
+        assert_eq!((up0.dtype(), up0.shape()), (Dtype::BF16, &[2usize, 2][..]));
+        assert_eq!(tensor_to_f32(&up0), vec![1.0, -2.5, 0.125, 3.0]);
+        // Norm weights stay F32.
+        let norm = st.tensor("model.layers.0.input_layernorm.weight").unwrap();
+        assert_eq!(norm.dtype(), Dtype::F32);
+        assert_eq!(tensor_to_f32(&norm), vec![0.5, 1.5]);
+        // BF16 passes through untouched.
+        let up1 = st.tensor("model.layers.1.mlp.up_proj.weight").unwrap();
+        assert_eq!(up1.dtype(), Dtype::BF16);
+        assert_eq!(tensor_to_f32(&up1), vec![4.0, -8.0]);
+
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(
+            files, 4,
+            "two sources, the index and the prepared file — no leftovers"
+        );
+    }
+
+    #[test]
+    fn interrupted_prepared_file_is_rebuilt_and_a_complete_one_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_model(dir.path());
+        let out = combine_safetensors_to_bf16(dir.path()).unwrap();
+        let good = std::fs::read(&out).unwrap();
+
+        // What an interrupted write under the final name would have left.
+        std::fs::write(&out, &good[..good.len() - 3]).unwrap();
+        assert!(!valid_combined_file(&out));
+        combine_safetensors_to_bf16(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), good);
+
+        let before = std::fs::metadata(&out).unwrap().modified().unwrap();
+        combine_safetensors_to_bf16(dir.path()).unwrap();
+        assert_eq!(std::fs::metadata(&out).unwrap().modified().unwrap(), before);
     }
 }

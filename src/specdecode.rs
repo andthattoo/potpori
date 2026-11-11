@@ -1,25 +1,20 @@
-//! Greedy speculative-decode driver — the orchestration core of the GLM-5.2 pipeline.
+//! Greedy speculative decoding, one chunk at a time — the reference driver.
 //!
-//! Substrate-agnostic: it drives a [`DraftEngine`] (node-0 local) against a
-//! [`TargetChain`] (the sharded target) over the traits in [`crate::engine`], so the
-//! accept/reject + KV-rollback logic here is identical whether the chain is Luminal on
-//! CUDA, a synthetic test, or a single process. Each round:
-//!   1. draft `gamma` tokens locally,
-//!   2. verify `[cur] + drafts` in one chain traversal,
-//!   3. accept the longest prefix matching the target's greedy argmax, take the correction,
-//!   4. roll back the speculative KV tail (`KvTruncate`).
+//! Each round:
+//!   1. the draft proposes `gamma` tokens,
+//!   2. the target verifies `[cur] + drafts` in one pass,
+//!   3. the longest prefix matching the target's own greedy tokens is committed, plus the
+//!      target's token at the first mismatch.
 //!
-//! Output is **bit-identical to plain greedy decode of the target** (greedy token-id
-//! equality), regardless of draft quality — the losslessness property validated in M1
-//! (`src/inference/engine.rs::test_spec_decode_characterization_qwen`) where the substrate
-//! is deterministic. This is the same loop, lifted off llama.cpp and onto the trait
-//! boundary so it serves the Luminal pipeline.
+//! Only the target's own picks are ever committed, so the output equals plain greedy decode
+//! of the target for any draft; draft quality changes speed only. `potpori chat` uses the
+//! pipelined driver ([`crate::specpipe`]), which is tested against this one.
 
 use crate::engine::{DraftEngine, TargetChain, TokenId};
 
 /// Spec-decode knobs.
 pub struct SpecConfig {
-    /// Draft length per chunk. Invest in acceptance rate, not large gamma: `gamma ∈ [8,16]`.
+    /// Draft length per chunk; the verification chunk is `gamma + 1` tokens.
     pub gamma: usize,
     /// Generation cap (tokens).
     pub max_new: usize,
@@ -33,7 +28,7 @@ pub struct SpecStats {
 }
 
 impl SpecStats {
-    /// Committed tokens per chain traversal — the speedup proxy (`≈ E[accepted] + 1`).
+    /// Committed tokens per chain traversal — the speedup over one-token-per-trip decoding.
     pub fn toks_per_traversal(&self) -> f64 {
         self.committed as f64 / self.traversals.max(1) as f64
     }
@@ -42,7 +37,7 @@ impl SpecStats {
 /// Run greedy speculative decode. `prompt` is the committed prefix; the driver prefills it
 /// into the chain, then generates up to `cfg.max_new` tokens. Returns the generated tokens
 /// (excluding the prompt) plus telemetry.
-#[allow(dead_code)] // the synchronous reference driver — used by tests + the CUDA check
+#[allow(dead_code)] // reference driver: used by tests and GPU diagnostics, not the CLI
 pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     draft: &mut D,
     target: &mut T,
@@ -63,7 +58,7 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
     let mut out: Vec<TokenId> = Vec::new();
     let mut traversals = 0usize;
 
-    // Prefill the prompt → chain KV holds [0, prompt.len()); `cur` is the pending token.
+    // Prefill the prompt → the KV holds [0, prompt.len()); `cur` is the pending token.
     let mut cur = target.prefill(prompt);
     let mut base = prompt.len() as u32; // absolute KV position where `cur` is fed
 
@@ -72,7 +67,7 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
             break;
         }
 
-        // Draft gamma tokens continuing [prompt ++ out ++ cur] (all local to node-0).
+        // Draft gamma tokens continuing [prompt ++ out ++ cur].
         let mut context = Vec::with_capacity(prompt.len() + out.len() + 1);
         context.extend_from_slice(prompt);
         context.extend_from_slice(&out);
@@ -113,12 +108,8 @@ pub fn run_spec_decode<D: DraftEngine, T: TargetChain>(
             }
         }
 
-        // Roll back the speculative KV tail: keep [0, base + n + 1) (cur + accepted drafts).
-        // Skip when everything was accepted (nothing speculative to drop).
-        if n < drafts.len() {
-            target.truncate(base + n as u32 + 1);
-        }
-
+        // The KV now holds a rejected tail past base + n; the next chunk starts there and
+        // overwrites it.
         cur = correction;
         base += n as u32 + 1;
     }
@@ -141,7 +132,7 @@ mod tests {
     /// sequence. Because the greedy output is well-defined by position, the driver must
     /// reproduce `truth` exactly — regardless of how good or bad the draft is. (Stateless:
     /// the absolute `start_pos` encodes how many tokens are committed, so no KV bookkeeping
-    /// is needed; `truncate` is therefore a no-op here.)
+    /// is needed.)
     struct SyntheticTarget {
         truth: Vec<TokenId>,
         prompt_len: u32,
@@ -160,7 +151,6 @@ mod tests {
                 .map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos))
                 .collect()
         }
-        fn truncate(&mut self, _keep_to_pos: u32) {}
         fn is_eos(&self, token: TokenId) -> bool {
             token == self.eos
         }

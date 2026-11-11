@@ -1,51 +1,59 @@
-//! Async depth-N **pipelined** speculative-decode driver — shard's `coordinate_pipe` in Rust.
+//! Depth-N **pipelined** speculative-decode driver — the one `potpori chat` runs.
 //!
 //! The synchronous driver ([`crate::specdecode::run_spec_decode`]) pays one full chain
-//! traversal per committed chunk. This driver keeps `depth` verify chunks in flight,
-//! speculatively chaining each chunk on the previous chunk's draft output. Replies are
-//! relayed upstream independently of work flowing downstream. On a
-//! divergence, every still-in-flight chunk is stale: they're drained-and-discarded and
-//! drafting re-seeds from the corrected prefix. Greedy id-equality keeps the committed
-//! output **bit-identical to the synchronous driver** (and to plain greedy decode).
+//! traversal per committed chunk. This driver keeps up to `depth` verification chunks in
+//! flight, chaining each on the previous chunk's *draft* output, so the chain's stages work on
+//! different chunks at once. When a chunk diverges from the target, every chunk still in
+//! flight was drafted on a wrong prefix: their results are drained and discarded, and
+//! drafting restarts from the corrected prefix.
 //!
-//! See `docs/shard-adoption-brief.md` (technique #1) and `docs/pipeline-specdecode-design.md`.
+//! Only tokens equal to the target's own greedy pick are committed, so the output equals the
+//! synchronous driver's (and plain greedy decode of the same chain) for any draft.
 
 use std::collections::VecDeque;
+
+use anyhow::{bail, Result};
 
 use crate::engine::{DraftEngine, TokenId};
 use crate::specdecode::{SpecConfig, SpecStats};
 
-/// A target chain that supports depth-N pipelining: many verify chunks in flight at once,
-/// completing in FIFO (submission) order.
+/// A target chain that supports pipelining: several verification chunks in flight at once,
+/// completing in submission (FIFO) order.
+///
+/// There is no rollback call. Every shard writes its KV at absolute positions and attends
+/// only to positions below the chunk it is running, so after a divergence the driver simply
+/// re-submits from the committed boundary and the stale speculative tail is overwritten.
+///
+/// The chain is other machines over a network, so every call can fail; the driver stops at
+/// the first error.
 pub trait PipelinedChain {
+    /// KV positions available on the smallest shard.
     fn capacity(&self) -> usize {
         usize::MAX
     }
     /// Prefill `prompt`; return the first pending token (the chain's argmax after the prompt).
-    fn prefill(&mut self, prompt: &[TokenId]) -> TokenId;
-    /// Submit a verify chunk `[cur] + drafts` whose first token sits at absolute KV position
-    /// `start_pos`. Non-blocking — the chunk enters the pipeline.
-    fn submit(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]);
-    /// Block for the next completed chunk's per-position argmaxes (FIFO; length `drafts.len()+1`).
-    fn poll(&mut self) -> Vec<TokenId>;
-    /// Roll back KV to keep `[0, keep_to_pos)` after a divergence flush.
-    fn truncate(&mut self, keep_to_pos: u32);
+    fn prefill(&mut self, prompt: &[TokenId]) -> Result<TokenId>;
+    /// Submit a verification chunk `[cur] + drafts` whose first token sits at absolute KV
+    /// position `start_pos`. Does not wait for the result.
+    fn submit(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]) -> Result<()>;
+    /// Block for the oldest in-flight chunk's per-position argmaxes (length `drafts.len() + 1`).
+    fn poll(&mut self) -> Result<Vec<TokenId>>;
     /// Whether `token` terminates generation.
     fn is_eos(&self, token: TokenId) -> bool;
 }
 
-/// Run depth-N pipelined greedy speculative decode. `depth` chunks are kept in flight.
-/// Output is identical to [`crate::specdecode::run_spec_decode`] (and to plain greedy).
+/// Run pipelined greedy speculative decode with up to `depth` chunks in flight. Returns the
+/// generated tokens (without the prompt) and telemetry.
 pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
     draft: &mut D,
     chain: &mut C,
     prompt: &[TokenId],
     cfg: &SpecConfig,
     depth: usize,
-) -> (Vec<TokenId>, SpecStats) {
+) -> Result<(Vec<TokenId>, SpecStats)> {
     assert!(cfg.gamma > 0, "gamma must be positive");
     if cfg.max_new == 0 {
-        return (Vec::new(), SpecStats::default());
+        return Ok((Vec::new(), SpecStats::default()));
     }
     let capacity = chain.capacity().min(draft.capacity());
     assert!(
@@ -57,7 +65,7 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
     let depth = depth.max(1);
     let prompt_len = prompt.len() as u32;
 
-    let cur0 = chain.prefill(prompt);
+    let cur0 = chain.prefill(prompt)?;
     let mut out: Vec<TokenId> = Vec::new();
     let mut done = chain.is_eos(cur0);
     if !done {
@@ -103,7 +111,7 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
                 single || ds.len() == gamma,
                 "draft returned the wrong token count"
             );
-            chain.submit(send_pos, cur, &ds);
+            chain.submit(send_pos, cur, &ds)?;
             dprefix.extend_from_slice(&ds);
             inflight.push_back(ds);
             send_pos += gamma as u32;
@@ -116,17 +124,18 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
         }
 
         // READ one completed chunk (FIFO).
-        let r = chain.poll();
+        let r = chain.poll()?;
         let ds = inflight.pop_front().unwrap();
-        assert_eq!(r.len(), ds.len() + 1, "invalid verification result length");
-        traversals += 1;
-        if std::env::var("POTPORI_DEBUG").is_ok() && traversals <= 14 {
-            eprintln!(
-                "[dbg] trav={traversals} ds[..3]={:?} r[..3]={:?} discard_pending={discard}",
-                &ds[..ds.len().min(3)],
-                &r[..r.len().min(3)]
+        if r.len() != ds.len() + 1 {
+            // `r[n]` below relies on this; a short answer from a remote must not panic the head.
+            bail!(
+                "chain returned {} tokens for a {}-token chunk",
+                r.len(),
+                ds.len() + 1
             );
         }
+        traversals += 1;
+        tracing::trace!(traversals, discard, ?ds, ?r, "chunk verified");
         if discard > 0 {
             discard -= 1; // stale (post-divergence or post-terminal) → skip
             continue;
@@ -168,7 +177,6 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
             // prompt_len + out.len() - 1 (shard's `pos`). The next chunk re-feeds the
             // correction at this position, overwriting the stale tail.
             let keep = prompt_len + out.len() as u32 - 1;
-            chain.truncate(keep);
             dprefix = prompt.to_vec();
             dprefix.extend_from_slice(&out);
             send_pos = keep;
@@ -176,17 +184,17 @@ pub fn run_spec_decode_pipelined<D: DraftEngine, C: PipelinedChain>(
     }
 
     let committed = out.len();
-    (
+    Ok((
         out,
         SpecStats {
             committed,
             traversals,
         },
-    )
+    ))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::TargetChain;
 
@@ -212,7 +220,8 @@ mod tests {
                     max_new: 10,
                 },
                 depth,
-            );
+            )
+            .unwrap();
             assert_eq!(out, truth[..10], "depth={depth}");
         }
     }
@@ -232,7 +241,8 @@ mod tests {
                     &[100],
                     &SpecConfig { gamma: 2, max_new },
                     depth,
-                );
+                )
+                .unwrap();
                 assert_eq!(out, truth[..max_new.min(3)]);
                 assert!(chain.q.is_empty(), "all in-flight requests must drain");
             }
@@ -249,10 +259,10 @@ mod tests {
             fn capacity(&self) -> usize {
                 self.limit
             }
-            fn prefill(&mut self, p: &[TokenId]) -> TokenId {
+            fn prefill(&mut self, p: &[TokenId]) -> Result<TokenId> {
                 self.inner.prefill(p)
             }
-            fn submit(&mut self, pos: u32, cur: TokenId, ds: &[TokenId]) {
+            fn submit(&mut self, pos: u32, cur: TokenId, ds: &[TokenId]) -> Result<()> {
                 assert!(pos as usize + ds.len() < self.limit);
                 assert!(
                     ds.is_empty() || ds.len() == 7,
@@ -263,11 +273,8 @@ mod tests {
                 }
                 self.inner.submit(pos, cur, ds)
             }
-            fn poll(&mut self) -> Vec<TokenId> {
+            fn poll(&mut self) -> Result<Vec<TokenId>> {
                 self.inner.poll()
-            }
-            fn truncate(&mut self, p: u32) {
-                self.inner.truncate(p)
             }
             fn is_eos(&self, t: TokenId) -> bool {
                 self.inner.is_eos(t)
@@ -293,7 +300,8 @@ mod tests {
                     max_new: 28,
                 },
                 depth,
-            );
+            )
+            .unwrap();
             assert_eq!(out, truth[..28]);
             assert!(c.single > 0);
         }
@@ -301,8 +309,8 @@ mod tests {
 
     /// Pipelined synthetic chain: its greedy continuation of any prompt is a fixed `truth`.
     /// FIFO queue of submitted chunks' `(start_pos, n_drafts)`; `poll` computes argmaxes
-    /// purely from `start_pos` (stateless ⇒ `truncate` is a no-op). The driver must
-    /// reproduce `truth` exactly, at every `depth`, with any draft.
+    /// purely from `start_pos` (stateless). The driver must reproduce `truth` exactly, at
+    /// every `depth`, with any draft.
     struct SyntheticPipe {
         truth: Vec<TokenId>,
         prompt_len: u32,
@@ -320,21 +328,21 @@ mod tests {
         }
     }
     impl PipelinedChain for SyntheticPipe {
-        fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
+        fn prefill(&mut self, prompt: &[TokenId]) -> Result<TokenId> {
             self.prompt_len = prompt.len() as u32;
-            *self.truth.first().unwrap_or(&self.eos)
+            Ok(*self.truth.first().unwrap_or(&self.eos))
         }
-        fn submit(&mut self, start_pos: u32, _cur: TokenId, drafts: &[TokenId]) {
+        fn submit(&mut self, start_pos: u32, _cur: TokenId, drafts: &[TokenId]) -> Result<()> {
             self.q.push_back((start_pos, drafts.len()));
+            Ok(())
         }
-        fn poll(&mut self) -> Vec<TokenId> {
+        fn poll(&mut self) -> Result<Vec<TokenId>> {
             let (start_pos, len) = self.q.pop_front().expect("poll with no in-flight chunk");
             let l = (start_pos - self.prompt_len) as usize; // gen index of `cur`
-            (0..=len)
+            Ok((0..=len)
                 .map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos))
-                .collect()
+                .collect())
         }
-        fn truncate(&mut self, _keep_to_pos: u32) {}
         fn is_eos(&self, token: TokenId) -> bool {
             token == self.eos
         }
@@ -377,13 +385,15 @@ mod tests {
                 truth: truth.clone(),
                 prompt_len: prompt.len(),
             };
-            let (out_p, _) = run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth);
+            let (out_p, _) =
+                run_spec_decode_pipelined(&mut d, &mut c, &prompt, &cfg, depth).unwrap();
             assert_eq!(out_p, expected, "perfect draft, depth={depth}");
 
             // Garbage draft: every chunk diverges ⇒ exercises the flush/discard path hard.
             let mut c2 = SyntheticPipe::new(truth.clone(), eos);
             let mut g = GarbageDraft;
-            let (out_g, _) = run_spec_decode_pipelined(&mut g, &mut c2, &prompt, &cfg, depth);
+            let (out_g, _) =
+                run_spec_decode_pipelined(&mut g, &mut c2, &prompt, &cfg, depth).unwrap();
             assert_eq!(out_g, expected, "garbage draft, depth={depth}");
         }
     }
@@ -421,7 +431,6 @@ mod tests {
                     .map(|j| *self.truth.get(l + 1 + j).unwrap_or(&self.eos))
                     .collect()
             }
-            fn truncate(&mut self, _: u32) {}
             fn is_eos(&self, t: TokenId) -> bool {
                 t == self.eos
             }
@@ -443,11 +452,212 @@ mod tests {
             truth: truth.clone(),
             prompt_len: prompt.len(),
         };
-        let (pipe_out, _) = run_spec_decode_pipelined(&mut pd, &mut pc, &prompt, &cfg, 4);
+        let (pipe_out, _) = run_spec_decode_pipelined(&mut pd, &mut pc, &prompt, &cfg, 4).unwrap();
 
         assert_eq!(
             sync_out, pipe_out,
             "pipelined output must equal synchronous output"
         );
+    }
+
+    // ---- Stateful synthetic chain: catches position bookkeeping, not just accept logic ----
+
+    /// Deterministic "model": the next token is a hash of the whole prefix, with EOS forced
+    /// once `eos_at` tokens have been generated. Unlike `SyntheticPipe`, the answer depends on
+    /// the tokens actually fed, so a driver that submits wrong tokens or positions is caught.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Oracle {
+        pub prompt_len: usize,
+        pub eos_at: Option<usize>,
+        pub eos: TokenId,
+    }
+    impl Oracle {
+        pub fn next(&self, prefix: &[TokenId]) -> TokenId {
+            let generated = prefix.len().saturating_sub(self.prompt_len);
+            if self.eos_at.is_some_and(|e| generated >= e) {
+                return self.eos;
+            }
+            let h = prefix.iter().fold(0x9E37_79B9u32, |h, &t| {
+                h.rotate_left(5).wrapping_mul(0x85EB_CA6B) ^ t as u32
+            });
+            (h % 50) as TokenId + 1
+        }
+        /// Plain greedy decode — the ground truth every driver must reproduce.
+        pub fn greedy(&self, prompt: &[TokenId], max_new: usize) -> Vec<TokenId> {
+            let mut ctx = prompt.to_vec();
+            let mut out = Vec::new();
+            while out.len() < max_new {
+                let t = self.next(&ctx);
+                if t == self.eos {
+                    break;
+                }
+                out.push(t);
+                ctx.push(t);
+            }
+            out
+        }
+    }
+
+    /// A chain with a position-indexed "KV" (the fed tokens by absolute position). Results are
+    /// computed at submit time from the KV as it stands, like the real FIFO chain, so stale
+    /// post-divergence chunks see stale state and the overwrite-rollback property is exercised.
+    struct KvPipe {
+        oracle: Oracle,
+        kv: Vec<TokenId>,
+        /// One past the highest absolute position ever fed.
+        positions_used: usize,
+        q: VecDeque<Vec<TokenId>>,
+    }
+    impl KvPipe {
+        fn new(oracle: Oracle) -> Self {
+            Self {
+                oracle,
+                kv: Vec::new(),
+                positions_used: 0,
+                q: VecDeque::new(),
+            }
+        }
+        fn feed(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<TokenId> {
+            let start = start_pos as usize;
+            assert!(start <= self.kv.len(), "chunk at {start} leaves a KV gap");
+            self.kv.truncate(start);
+            let mut out = Vec::with_capacity(tokens.len());
+            for &t in tokens {
+                self.kv.push(t);
+                out.push(self.oracle.next(&self.kv));
+            }
+            self.positions_used = self.positions_used.max(self.kv.len());
+            out
+        }
+        fn chunk(cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
+            std::iter::once(cur).chain(drafts.iter().copied()).collect()
+        }
+    }
+    impl PipelinedChain for KvPipe {
+        fn prefill(&mut self, prompt: &[TokenId]) -> Result<TokenId> {
+            self.q.clear();
+            Ok(*self.feed(0, prompt).last().unwrap())
+        }
+        fn submit(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]) -> Result<()> {
+            let r = self.feed(start_pos, &Self::chunk(cur, drafts));
+            self.q.push_back(r);
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Vec<TokenId>> {
+            Ok(self.q.pop_front().expect("poll with no in-flight chunk"))
+        }
+        fn is_eos(&self, token: TokenId) -> bool {
+            token == self.oracle.eos
+        }
+    }
+    impl TargetChain for KvPipe {
+        fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
+            *self.feed(0, prompt).last().unwrap()
+        }
+        fn verify(&mut self, start_pos: u32, cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
+            self.feed(start_pos, &Self::chunk(cur, drafts))
+        }
+        fn is_eos(&self, token: TokenId) -> bool {
+            token == self.oracle.eos
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Quality {
+        /// The target's own greedy continuation (keeps emitting EOS after the end).
+        Perfect,
+        /// Never right.
+        Garbage,
+        /// Right, except one wrong token on every other call.
+        Flaky,
+        /// Right, except the chunk's last token is always EOS.
+        EosAtChunkEnd,
+        /// Every token is EOS.
+        AllEos,
+    }
+    pub(crate) const QUALITIES: [Quality; 5] = [
+        Quality::Perfect,
+        Quality::Garbage,
+        Quality::Flaky,
+        Quality::EosAtChunkEnd,
+        Quality::AllEos,
+    ];
+    pub(crate) struct OracleDraft {
+        pub oracle: Oracle,
+        pub quality: Quality,
+        pub calls: usize,
+    }
+    impl DraftEngine for OracleDraft {
+        fn draft(&mut self, context: &[TokenId], gamma: usize) -> Vec<TokenId> {
+            self.calls += 1;
+            let mut ctx = context.to_vec();
+            let mut out = Vec::with_capacity(gamma);
+            for _ in 0..gamma {
+                let t = self.oracle.next(&ctx);
+                out.push(t);
+                ctx.push(t);
+            }
+            match self.quality {
+                Quality::Perfect => {}
+                Quality::Garbage => out.fill(i32::MIN),
+                Quality::Flaky if self.calls.is_multiple_of(2) => out[self.calls % gamma] = 77,
+                Quality::Flaky => {}
+                Quality::EosAtChunkEnd => *out.last_mut().unwrap() = self.oracle.eos,
+                Quality::AllEos => out.fill(self.oracle.eos),
+            }
+            out
+        }
+    }
+
+    /// The whole grid: gamma x depth x answer length x draft quality. Both drivers must equal
+    /// plain greedy decode, whether generation ends on EOS or on `max_new`, and must leave
+    /// nothing in flight.
+    #[test]
+    fn drivers_equal_greedy_across_the_grid() {
+        let eos = 9999;
+        let prompt = vec![11, 12, 13];
+        let max_new = 17;
+        for eos_at in (0..=22usize).map(Some).chain([None]) {
+            let oracle = Oracle {
+                prompt_len: prompt.len(),
+                eos_at,
+                eos,
+            };
+            let expected = oracle.greedy(&prompt, max_new);
+            for gamma in 1..=5usize {
+                let cfg = SpecConfig { gamma, max_new };
+                for quality in QUALITIES {
+                    let case = format!("eos_at={eos_at:?} gamma={gamma} {quality:?}");
+                    let mut draft = OracleDraft {
+                        oracle,
+                        quality,
+                        calls: 0,
+                    };
+                    let mut target = KvPipe::new(oracle);
+                    let (out, _) =
+                        crate::specdecode::run_spec_decode(&mut draft, &mut target, &prompt, &cfg);
+                    assert_eq!(out, expected, "sync {case}");
+
+                    for depth in 1..=6usize {
+                        let mut draft = OracleDraft {
+                            oracle,
+                            quality,
+                            calls: 0,
+                        };
+                        let mut chain = KvPipe::new(oracle);
+                        let (out, stats) =
+                            run_spec_decode_pipelined(&mut draft, &mut chain, &prompt, &cfg, depth)
+                                .unwrap();
+                        assert_eq!(out, expected, "pipelined depth={depth} {case}");
+                        assert_eq!(stats.committed, out.len());
+                        assert!(chain.q.is_empty(), "driver left chunks in flight: {case}");
+                        assert!(
+                            chain.positions_used <= prompt.len() + max_new + depth * gamma,
+                            "speculation ran past the documented bound: {case}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

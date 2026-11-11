@@ -1,16 +1,28 @@
-//! Native Luminal backend adapters. Device allocations outlive compiled programs.
+//! Luminal backend adapters (CUDA, Metal) behind one small trait. A runtime is created empty
+//! with `Default`, compiled once for a shard's graph, then stepped; device allocations
+//! outlive the compiled programs.
 use super::model::{Inputs, QwenGraph};
 use anyhow::Result;
+
 pub trait QwenRuntime {
+    /// Search and compile kernels for `graph`, and upload `weights`.
     fn compile(&mut self, graph: &QwenGraph, weights: Inputs, search_graphs: usize) -> Result<()>;
+    /// Run `query` new positions with `context` positions visible in total; returns the
+    /// graph's output (residual stream or logits) as f32.
     fn step(&mut self, inputs: Inputs, query: usize, context: usize) -> Result<Vec<f32>>;
+    /// Clear the KV cache.
     fn reset(&mut self) -> Result<()>;
 }
+
+// The adapters keep the per-bucket search reports of the Luminal examples they derive from;
+// nothing reads them yet.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)]
 mod cuda;
 #[cfg(feature = "cuda")]
 mod cuda_memory;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+#[allow(dead_code)]
 mod metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_memory;
@@ -20,14 +32,6 @@ macro_rules! adapter {
         #[derive(Default)]
         pub struct $name {
             backend: Option<$module::$backend>,
-        }
-        impl $name {
-            pub fn new() -> Result<Self> {
-                Ok(Self::default())
-            }
-            pub fn initialize(_: ()) -> Self {
-                Self::default()
-            }
         }
         impl QwenRuntime for $name {
             fn compile(

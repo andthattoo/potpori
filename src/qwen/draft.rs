@@ -1,14 +1,11 @@
-//! The production draft engine: a small Qwen target kept incrementally in sync on the head.
+//! The head's draft engine: a small Qwen model whose KV cache is kept in step with the
+//! generation, so each call only pays for tokens it has not seen.
 //!
-//! Unlike the test-only `QwenDraft` (which re-prefilled the whole context every call — O(ctx)
-//! per round), this keeps its own KV cache warm: each `draft()` call feeds only the tokens
-//! committed since the last call (single-token steps, so it works with both the generic and
-//! the chunk-specialized kernel buckets), then greedily speculates γ tokens.
-//!
-//! Rollback safety is the same absolute-position-overwrite property as the target chain: the
-//! speculative feeds (positions ≥ n) are never counted as synced, so the next catch-up
-//! overwrites them; on a driver divergence-reset (context shrinks) we re-feed the last
-//! committed token to refresh the prediction.
+//! Each `draft()` call first feeds whatever part of the context differs from what the model
+//! was last fed (in pieces matching its compiled kernels), then greedily speculates γ tokens.
+//! The speculative tokens stay in the KV: when the driver echoes them back as context they
+//! cost nothing, and when the driver rejects them the next call overwrites them from the
+//! first position that differs — the same absolute-position overwrite the target chain uses.
 
 use crate::engine::{DraftEngine, TargetChain, TokenId};
 
@@ -77,12 +74,7 @@ impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
         // for position n (absolute-position overwrite makes the re-feed harmless).
         let start = agree.min(n.saturating_sub(1));
 
-        if std::env::var("POTPORI_DEBUG").is_ok() && n < 120 {
-            eprintln!(
-                "[dbg-draft] n={n} agree={agree} start={start} tail_ctx={:?}",
-                &context[n.saturating_sub(3)..]
-            );
-        }
+        tracing::trace!(n, agree, start, "draft catch-up");
         let mut cur = self.feed_range(context, start, n);
         self.fed.truncate(start);
         self.fed.extend_from_slice(&context[start..n]);

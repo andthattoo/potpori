@@ -1,30 +1,30 @@
-//! Whole-model target implemented through the same native shard adapter.
+//! A whole model in one process: one shard that is both first and last.
+//!
+//! Used as the draft model on the head and as the single-process baseline in tests.
 pub use super::runtime::QwenRuntime;
 use super::{model::QwenConfig, shard::Shard};
 use crate::engine::{TargetChain, TokenId};
+use crate::node::ShardEngine;
+
+/// Greedy pick over one row of logits. Panics on empty or non-finite logits: in a local model
+/// that is a broken kernel, and continuing would only produce garbage tokens.
 pub(crate) fn argmax(row: &[f32]) -> TokenId {
-    assert!(
-        !row.is_empty() && row.iter().all(|x| x.is_finite()),
-        "non-finite or empty logits"
-    );
-    row.iter()
-        .enumerate()
-        .fold((0, f32::NEG_INFINITY), |best, (i, &v)| {
-            if v > best.1 {
-                (i, v)
-            } else {
-                best
-            }
-        })
-        .0 as TokenId
+    crate::engine::argmax(row).expect("non-finite or empty logits")
 }
+
 pub struct QwenTarget<R: QwenRuntime> {
     shard: Shard<R>,
 }
+
 impl<R: QwenRuntime + 'static> QwenTarget<R> {
+    /// Load with generic kernels (any chunk size). Diagnostics and tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load(runtime: R, cfg: QwenConfig, path: &str, capacity: usize, search: usize) -> Self {
         Self::load_chunked(runtime, cfg, path, capacity, search, 0)
     }
+
+    /// Load every layer of `cfg` from the prepared weights at `path`. See
+    /// [`Shard::load_chunked`] for `chunk`.
     pub fn load_chunked(
         runtime: R,
         cfg: QwenConfig,
@@ -47,10 +47,14 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
             ),
         }
     }
+
+    /// Clear the KV cache.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset(&mut self) {
         self.shard.reset();
     }
 }
+
 impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
     fn capacity(&self) -> usize {
         self.shard.capacity()
@@ -68,11 +72,30 @@ impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
             .map(argmax)
             .collect()
     }
-    fn truncate(&mut self, _: u32) {}
-    fn is_eos(&self, t: TokenId) -> bool {
-        t == 151645 || t == 151643
+    fn is_eos(&self, token: TokenId) -> bool {
+        super::is_eos(token)
     }
 }
+
+/// Plain greedy decode through the verify primitive, one token per step: the reference the
+/// speculative drivers are compared against in the Metal tests.
+#[cfg(all(test, feature = "metal", target_vendor = "apple"))]
+pub(crate) fn greedy<T: TargetChain>(
+    t: &mut T,
+    prompt: &[TokenId],
+    max_new: usize,
+) -> Vec<TokenId> {
+    let mut cur = t.prefill(prompt);
+    let mut out = Vec::new();
+    let mut base = prompt.len() as u32;
+    while !t.is_eos(cur) && out.len() < max_new {
+        out.push(cur);
+        cur = t.verify(base, cur, &[])[0];
+        base += 1;
+    }
+    out
+}
+
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
 mod tests {
     use super::*;
@@ -105,34 +128,14 @@ mod tests {
         }
     }
 
-    /// Plain incremental greedy decode via the verify primitive (empty draft → 1 token/step).
-    fn greedy_baseline(
-        t: &mut impl TargetChain,
-        prompt: &[TokenId],
-        max_new: usize,
-    ) -> Vec<TokenId> {
-        let mut cur = t.prefill(prompt);
-        let mut out = Vec::new();
-        let mut base = prompt.len() as u32;
-        loop {
-            if t.is_eos(cur) || out.len() >= max_new {
-                break;
-            }
-            out.push(cur);
-            cur = t.verify(base, cur, &[])[0];
-            base += 1;
-        }
-        out
-    }
-
-    // cargo test -p dria-node --features metal qwen_target_spec_decode -- --ignored --nocapture
+    // cargo test --release --features metal qwen_target_spec_decode -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_target_spec_decode() {
         let model_dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B")
             .expect("download/prepare Qwen3-0.6B");
-        let weights = model_dir.join("model_combined_bf16_v1.safetensors");
-        let rt = crate::qwen::runtime::MetalRuntime::initialize(());
+        let weights = model_dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
+        let rt = crate::qwen::runtime::MetalRuntime::default();
         let mut target = QwenTarget::load(
             rt,
             QwenConfig::QWEN3_0_6B,
@@ -146,7 +149,7 @@ mod tests {
         let cfg = SpecConfig { gamma: 4, max_new };
 
         target.reset();
-        let baseline = greedy_baseline(&mut target, &prompt, max_new);
+        let baseline = greedy(&mut target, &prompt, max_new);
 
         target.reset();
         let mut draft = NgramDraft;
@@ -160,10 +163,14 @@ mod tests {
                 println!("LOSSLESS: spec-decode == greedy baseline on Qwen3-0.6B (Luminal/Metal)")
             }
             Some(i) => println!(
-                "DIVERGE @{i}: baseline={} spec={} (likely a bf16 near-tie — cf. M1 substrate finding)",
+                "DIVERGE @{i}: baseline={} spec={} (a numerical near-tie between kernels?)",
                 baseline[i], spec[i]
             ),
-            None => println!("length differ: baseline={} spec={}", baseline.len(), spec.len()),
+            None => println!(
+                "length differ: baseline={} spec={}",
+                baseline.len(),
+                spec.len()
+            ),
         }
         assert!(!baseline.is_empty(), "model must generate something");
     }
@@ -180,11 +187,9 @@ mod tests {
             let mut cur = self.model.prefill(context);
             let mut out = Vec::with_capacity(gamma);
             out.push(cur);
-            let mut base = context.len() as u32;
-            for _ in 1..gamma {
+            for (base, _) in (context.len() as u32..).zip(1..gamma) {
                 cur = self.model.verify(base, cur, &[])[0];
                 out.push(cur);
-                base += 1;
             }
             out
         }
@@ -192,24 +197,24 @@ mod tests {
 
     // THE REAL ACCEPTANCE NUMBER: Qwen3-0.6B drafts Qwen3-4B, greedy, on Luminal/Metal.
     // toks/traversal = E[accepted]+1 is the speedup proxy the throughput thesis hinges on.
-    // cargo test -p dria-node --features metal qwen_real_g_4b -- --ignored --nocapture
+    // cargo test --release --features metal qwen_real_g_4b -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_real_g_4b() {
         let dir4b = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-4B").expect("prepare 4B");
         let dir06b = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-        let w4b = dir4b.join("model_combined_bf16_v1.safetensors");
-        let w06b = dir06b.join("model_combined_bf16_v1.safetensors");
+        let w4b = dir4b.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
+        let w06b = dir06b.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
 
         let mut target = QwenTarget::load(
-            crate::qwen::runtime::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::default(),
             QwenConfig::QWEN3_4B,
             w4b.to_str().unwrap(),
             512,
             200,
         );
         let mut draft_model = QwenTarget::load(
-            crate::qwen::runtime::MetalRuntime::initialize(()),
+            crate::qwen::runtime::MetalRuntime::default(),
             QwenConfig::QWEN3_0_6B,
             w06b.to_str().unwrap(),
             512,
@@ -221,7 +226,7 @@ mod tests {
         let spec_cfg = SpecConfig { gamma: 8, max_new };
 
         target.reset();
-        let baseline = greedy_baseline(&mut target, &prompt, max_new);
+        let baseline = greedy(&mut target, &prompt, max_new);
 
         target.reset();
         draft_model.reset();
@@ -241,7 +246,7 @@ mod tests {
         match (0..baseline.len().min(spec.len())).find(|&i| baseline[i] != spec[i]) {
             None if baseline.len() == spec.len() => println!("LOSSLESS vs greedy-4B"),
             Some(i) => println!(
-                "diverge @{i}: baseline={} spec={} (bf16 near-tie? cf. M1)",
+                "diverge @{i}: baseline={} spec={} (a numerical near-tie between kernels?)",
                 baseline[i], spec[i]
             ),
             None => println!(
@@ -257,14 +262,14 @@ mod tests {
     // model the MLP/projections dominate and are CONSTANT per token; attention is sub-dominant, so
     // ms/step should be nearly flat. If it grows steeply with context, the model forward itself is
     // the culprit (re-prefill? naive O(context) attention/GQA kernel?), not the pipeline.
-    // cargo test -p dria-node --features metal qwen_forward_scaling -- --ignored --nocapture
+    // cargo test --release --features metal qwen_forward_scaling -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_forward_scaling() {
         use std::time::Instant;
         let dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("0.6B");
-        let weights = dir.join("model_combined_bf16_v1.safetensors");
-        let rt = crate::qwen::runtime::MetalRuntime::initialize(());
+        let weights = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
+        let rt = crate::qwen::runtime::MetalRuntime::default();
         let mut target = QwenTarget::load(
             rt,
             QwenConfig::QWEN3_0_6B,
@@ -298,15 +303,15 @@ mod tests {
     // DIAGNOSTIC: forward time vs CHUNK SIZE s (tokens fed at once) at fixed context, single-
     // process. Spec-decode uses s=γ+1 (multi-token); single-token decode uses s=1. If s≥2 is far
     // slower than s=1, the multi-token kernel (dim bucket [2,max_seq], generic) is the bottleneck
-    // vs the specialized [1,1] kernel. cargo test -p dria-node --features metal
+    // vs the specialized [1,1] kernel. cargo test --release --features metal
     // qwen_forward_vs_chunk_size -- --ignored --nocapture
     #[test]
     #[ignore]
     fn qwen_forward_vs_chunk_size() {
         use std::time::Instant;
         let dir = crate::qwen::hf::prepare_hf_model("Qwen/Qwen3-0.6B").expect("0.6B");
-        let weights = dir.join("model_combined_bf16_v1.safetensors");
-        let rt = crate::qwen::runtime::MetalRuntime::initialize(());
+        let weights = dir.join(crate::qwen::hf::COMBINED_WEIGHTS_FILE);
+        let rt = crate::qwen::runtime::MetalRuntime::default();
         let mut target = QwenTarget::load(
             rt,
             QwenConfig::QWEN3_0_6B,

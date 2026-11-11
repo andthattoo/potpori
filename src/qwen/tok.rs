@@ -1,8 +1,8 @@
 //! Tokenizer + chat template for the Qwen3 family (both target and draft share it).
 //!
-//! The engine works on raw token ids; this is the text boundary. M0 hardcodes the simple
-//! Qwen3 ChatML-style template (single-turn, thinking disabled) instead of parsing the
-//! repo's jinja template.
+//! The engine works on raw token ids; this is the text boundary. The Qwen3 ChatML-style
+//! template is hardcoded (single turn, thinking disabled) rather than parsed from the repo's
+//! jinja template.
 
 use anyhow::{anyhow, Context, Result};
 

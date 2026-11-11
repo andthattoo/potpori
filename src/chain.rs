@@ -1,11 +1,9 @@
-//! Chain configuration — the static "who serves which layers" file for a friend-group chain.
+//! The chain config: a TOML file on the head that says which node serves which layers.
 //!
-//! M0 keeps this deliberately dumb: a TOML file everyone shares. The first node is the HEAD
-//! (runs locally in `potpori chat`: embeddings + first layer block + the draft model). The
-//! remaining nodes are remote, in pipeline order; the last one is the TAIL (final norm+lm_head).
-//! Each remote friend runs `potpori serve` with their layer range; middles are told their
-//! downstream address. Discovery/NAT traversal/re-planning come later (see
-//! `docs/chain-formation-design.md`).
+//! The first node is the head (it runs inside `potpori chat`: tokenizer, first layer block and
+//! the draft model). The remaining nodes are remote, in pipeline order; the last one is the
+//! tail (final norm and output projection). Each remote friend runs `potpori serve` with the
+//! matching layer range, and middles are told their downstream address.
 
 use std::path::Path;
 
@@ -25,10 +23,10 @@ pub struct ChainConfig {
     /// Max sequence length — sizes every shard's KV cache.
     #[serde(default = "default_max_seq")]
     pub max_seq: usize,
-    /// How many in-flight verify chunks the pipelined driver keeps (depth-N pipelining).
+    /// How many verification chunks the driver keeps in flight (1 = no pipelining).
     #[serde(default = "default_depth")]
     pub depth: usize,
-    /// Egglog search budget per shard load (higher = better kernels, slower startup).
+    /// Kernel search budget per shard load (higher = better kernels, slower startup).
     #[serde(default = "default_search_graphs")]
     pub search_graphs: usize,
     /// Pipeline order: nodes[0] = head (local), nodes[1..] remote, last = tail.
@@ -52,18 +50,21 @@ fn default_gamma() -> usize {
 fn default_max_seq() -> usize {
     768
 }
+fn default_depth() -> usize {
+    4
+}
+fn default_search_graphs() -> usize {
+    200
+}
+
+/// Layer count of each supported model. Kept here, not with the model code, so the config is
+/// validated in builds without the inference engine (a test checks the two tables agree).
 pub fn model_layers(repo: &str) -> Option<usize> {
     match repo {
         "Qwen/Qwen3-0.6B" | "Qwen/Qwen3-1.7B" => Some(28),
         "Qwen/Qwen3-4B" => Some(36),
         _ => None,
     }
-}
-fn default_depth() -> usize {
-    4
-}
-fn default_search_graphs() -> usize {
-    200
 }
 
 impl ChainConfig {
@@ -124,10 +125,7 @@ impl ChainConfig {
                 .as_ref()
                 .unwrap()
                 .parse::<std::net::SocketAddr>()
-                .with_context(|| format!("invalid address on node {i}"))?;
-            if n.layers[0] >= n.layers[1] {
-                bail!("node {i} has an empty layer range");
-            }
+                .with_context(|| format!("node {i}: addr must be IP:port"))?;
         }
         Ok(())
     }
