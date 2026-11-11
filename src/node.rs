@@ -500,7 +500,7 @@ pub(crate) mod tests {
         }
         fn forward_hidden(&mut self, _pos: u32, s: usize, mut hidden: Vec<f32>) -> Vec<f32> {
             self.seen.fetch_add(1, Ordering::SeqCst);
-            for row in hidden.chunks_exact_mut(HIDDEN) {
+            for row in hidden.as_chunks_mut::<HIDDEN>().0 {
                 row[HIDDEN - 1] += self.checksum();
             }
             if self.layers.1 != TOTAL_LAYERS {
@@ -508,7 +508,7 @@ pub(crate) mod tests {
             }
             let want: f32 = (1..=TOTAL_LAYERS).map(|l| l as f32).sum();
             let mut logits = vec![if self.nan { f32::NAN } else { 0.0 }; s * VOCAB];
-            for (j, row) in hidden.chunks_exact(HIDDEN).enumerate() {
+            for (j, row) in hidden.as_chunks::<HIDDEN>().0.iter().enumerate() {
                 let bytes = [row[0] as u8, row[1] as u8, row[2] as u8, row[3] as u8];
                 let token = if row[HIDDEN - 1] == want {
                     u32::from_le_bytes(bytes) as usize
