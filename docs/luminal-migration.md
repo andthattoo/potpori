@@ -28,8 +28,8 @@ Behavioral changes accompanying the migration:
 - EOS is terminal only after verification. Zero/one-token limits are respected.
 - Capacity bounds include speculative lookahead; single-token steps handle the
   last cache positions without requesting unsupported partial kernel sizes.
-- Mutual TLS replaces disabled certificate verification. Wire ALPN is now
-  `potpori-shard-v2`; older binaries are intentionally incompatible.
+- Mutual TLS replaces disabled certificate verification. The wire ALPN was bumped
+  (`potpori-shard-v2` at the time); older binaries are intentionally incompatible.
 - Session negotiation checks model geometry, contiguous layer boundaries, cache
   size and chunk size. Frames and result correlation are validated.
 - Middles process/forward work independently of downstream result relay with a
@@ -56,3 +56,15 @@ require hardware-specific integration runs. Historical A6000 and Metal timings
 predate this migration and must not be carried forward as new measurements.
 Metal runtime execution was not available on this Windows host. The workflow adds
 macOS Metal compilation and Linux CUDA compilation; those CI jobs have not run yet.
+
+## Changes since the migration
+
+- Wire `potpori-shard-v3`: hidden-state payloads are raw msgpack bytes, unused frame fields
+  and the no-op truncate message are gone, and nodes send an `Error` with a reason when a
+  handshake is refused or a session fails. The head reports that reason.
+- The chain roles live in `src/node.rs`, generic over a shard, and are tested over real QUIC
+  with a synthetic shard. Network failures on the head are errors, not panics.
+- Weight preparation streams from the memory-mapped downloads; peak memory is one tensor.
+- The Metal chain tests were consolidated onto this protocol. They compile in CI but, like
+  the rest of the Metal backend, have not been executed since the migration.
+

@@ -1,57 +1,76 @@
 # potpori
 
-Sharded Qwen3 inference across friends' GPUs, with greedy speculative decoding over authenticated QUIC connections.
+Sharded Qwen3 inference across friends' GPUs, with greedy speculative decoding over
+authenticated QUIC connections.
 
-Potpori is a Rust CLI on [Luminal](https://github.com/luminal-ai/luminal). The current dependency is pinned to upstream commit [`1cbb917`](https://github.com/luminal-ai/luminal/commit/1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1), the latest `main` checked on October 29, 2026. See [the migration notes](docs/luminal-migration.md) for the API changes and validation limits.
+Potpori is a Rust CLI on [Luminal](https://github.com/luminal-ai/luminal), pinned to upstream
+commit [`1cbb917`](https://github.com/luminal-ai/luminal/commit/1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1).
 
-## Architecture
+## How it works
 
 ```text
 head: tokenizer + embeddings + first layers + draft model
   → middle: next layers → tail: final layers + output projection
-  ← verification results relayed through the middle ←
+  ← verification results relayed back through the middle ←
 ```
 
-The head proposes tokens with a small Qwen3 model. Each target shard verifies a chunk, returning the target's greedy token at every position. Accepted tokens match the target; rejected tails are overwritten at absolute KV positions. Only verified EOS tokens stop generation. Near cache capacity, the driver drains speculation and uses single-token verification.
+A model is cut into contiguous layer ranges, one per machine. The head proposes several
+tokens with a small draft model; the chain checks them all in one pass and returns the target
+model's own greedy token at every position. Tokens that match are kept, the first mismatch is
+replaced by the target's token, and anything speculative after it is overwritten in each
+shard's KV cache. A wrong draft costs speed, never output: only the target's own picks are
+committed, and only a verified end-of-sequence token stops generation.
 
-Several chunks can remain in flight. Middle nodes forward new work independently of result relay using bounded queues. This enables stage overlap; it does not eliminate network latency. Results currently return through the chain.
+Several verification chunks stay in flight at once (`depth`), so the machines work on
+different chunks at the same time and network round trips overlap with compute. Middle nodes
+forward new work without waiting for results. Results currently return through the chain.
 
-Supported configurations: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, and `Qwen/Qwen3-4B`. GLM/MoE, NVFP4, sampling, NAT traversal and session reconnection remain future work. Greedy equivalence also depends on the backend's numerical behavior across batch sizes; full-model parity must be validated for the intended hardware/configuration.
+Supported models: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B` and `Qwen/Qwen3-4B`. Not built yet:
+other model families, sampling (decoding is greedy), NAT traversal, and reconnecting after a
+node drops. Output equals greedy decoding *of the same chain*; whether that matches a
+single-process run token for token depends on the backend's numerics and has to be checked
+per hardware setup.
 
 ## Build
 
-Use current stable Rust (Luminal requires at least Rust 1.91) and the platform's native build tools.
+Current stable Rust (1.91 or newer) and the platform's native build tools.
 
 ```sh
 cargo build --locked --release --features metal  # macOS / Apple Silicon
 cargo build --locked --release --features cuda   # NVIDIA
 ```
 
-CUDA needs a compatible driver, CUDA toolkit headers including CCCL, NVRTC, and cuBLAS available to the dynamic loader. CUDA 12.9 was used for the local migration checks. `CUDA_PATH` / `CUDA_HOME` can identify the toolkit; `LUMINAL_CUDA_HEADERS_DIR` can point directly to its include directory. For an installation without `nvcc`, set `CUDARC_CUDA_VERSION` to the installed version (for example `12090` for 12.9).
+CUDA needs a compatible driver and the CUDA toolkit (headers including CCCL, NVRTC, cuBLAS)
+visible to the dynamic loader; 12.9 is what has been tested. `CUDA_PATH` / `CUDA_HOME`
+identify the toolkit, and `LUMINAL_CUDA_HEADERS_DIR` can point straight at its include
+directory. Without `nvcc`, set `CUDARC_CUDA_VERSION` (for example `12090` for 12.9).
 
-The native graph uses F32 arithmetic and KV state on both backends, with explicit casts from BF16 checkpoint storage. `POTPORI_DTYPE` no longer selects arithmetic precision. Previous F16/BF16 performance measurements apply to the historical backend, not this migration.
+Both backends compute in F32, casting from BF16 checkpoint storage.
 
 ## Establish peer trust
 
-Generate a separate identity on each machine:
+Each machine has its own identity:
 
 ```sh
 potpori identity --out identity
 ```
 
-Keep `identity/key.pem` private. Exchange `identity/cert.pem` through a trusted channel with your adjacent peers. Collect the peer certificates in `identity/peers.pem`, for example on the middle node:
+Keep `identity/key.pem` private. Give `identity/cert.pem` to the machines next to you in the
+chain, and collect theirs in `identity/peers.pem` — for example on a middle node:
 
 ```sh
 cat head-cert.pem tail-cert.pem > identity/peers.pem
 ```
 
-Both ends verify certificates. There is no insecure mode. The head needs the middle's certificate; the middle needs the head's and tail's certificates; the tail needs the middle's certificate. Custom paths are accepted by `serve` and `chat` through `--cert`, `--key`, and `--trust`.
+Both ends of every connection verify certificates; there is no insecure mode. The head needs
+the certificate of the first remote node, each middle needs its two neighbours', and the tail
+needs its upstream neighbour's. `serve` and `chat` take `--cert`, `--key` and `--trust` for
+other paths.
 
-## Run a three-machine chain
+## Run a chain
 
-Copy `chain.example.toml` to `chain.toml` on the head and edit the IP addresses. Every server's model, layer boundaries, cache capacity, and verification chunk must agree with the chain. The session handshake checks compatibility before processing activations.
-
-Start the tail, then the middle:
+Copy `chain.example.toml` to `chain.toml` on the head and edit the addresses. Start the tail,
+then the middle:
 
 ```sh
 potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
@@ -62,31 +81,81 @@ potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
   --chunk 8 --max-seq 768
 ```
 
-Then run the head:
+Then the head:
 
 ```sh
 potpori chat --chain chain.toml --max-new 128 \
   --prompt "Explain speculative decoding in one paragraph."
 ```
 
-`--chunk` must equal `gamma + 1`; `--max-seq` must equal `max_seq`. Tokenized prompt length plus `--max-new` must fit the cache. Fixed kernels cover one token and the verification chunk size. Configuration errors are rejected before loading model weights.
+`--chunk` must equal `gamma + 1` and `--max-seq` must equal `max_seq` from the chain config.
+The prompt plus `--max-new` must fit in `max_seq`. A session starts with a handshake between
+each pair of neighbours; if a node was started with a different model, layer range, cache size
+or chunk size, `chat` fails at connect and says which node refused and which setting differs.
+A failure during generation is reported the same way.
 
-The first run downloads and prepares weights, then searches GPU implementations for each bucket. Preparation currently downloads the whole model on each participant and combines its tensors in host memory; only the local shard's parameters are uploaded to its runtime. Allow host RAM and disk for preparation. Prepared files are validated and published by atomic replacement.
+The first run on each machine downloads the whole model, prepares the weights (streamed to a
+single file in the Hugging Face cache; allow disk for a second copy) and searches GPU kernels
+for the shard, which takes minutes. The head waits up to 15 minutes for a node that is still
+loading.
+
+`chat` ends with three lines of measurements:
+
+```text
+[212 tokens in 21.4s = 9.9 tok/s overall, 11.6 tok/s after prefill | 2.71 tok/traversal over 78 traversals | γ=7 depth=4 chain=2 nodes]
+[time: prefill 3.10s (41 prompt tokens) | head shard 4.20s | waiting on chain 9.80s | draft + rest 4.30s]
+[link: round trip 38.2 ms at connect, 36.9 ms now | 85 frames, 80.0 KiB each | head on metal]
+```
+
+`tok/traversal` is how many tokens each trip through the chain committed (draft acceptance).
+`--depth N` overrides the config for one run; comparing `--depth 1` with `--depth 4` shows
+what pipelining buys over a given link.
+
+For a first run between two machines, follow [docs/two-machine-test.md](docs/two-machine-test.md).
 
 ## Checks
 
 ```sh
-cargo test --locked                       # GPU-free coordination and QUIC tests
-cargo test --locked --features engine     # also model/loading checks; no GPU required
-cargo check --locked --features cuda --all-targets
-cargo clippy --locked --features cuda --all-targets -- -D warnings
-cargo test --locked --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
+cargo test --locked                       # drivers, wire and chain protocol — no GPU
+cargo test --locked --features engine     # plus model and weight-preparation checks — no GPU
+cargo clippy --locked --features engine --all-targets -- -D warnings
 ```
 
-The tiny GPU test creates deterministic weights locally and checks an independent scalar CPU reference, shard equivalence, and KV rollback. Tests that download real Qwen weights or need a GPU are explicitly ignored by default. QUIC tests require local UDP access. Historical GPU tests remain available under the matching backend feature; their earlier results do not establish parity after a compiler upgrade.
+The chain protocol is tested end to end over real QUIC with a synthetic shard: two- and
+three-node chains against greedy decoding, handshake refusals, malformed frames, and failing
+or vanishing nodes.
+
+GPU tests are `#[ignore]`d and run by name:
+
+```sh
+# CUDA: tiny generated model, no download — shard equivalence and KV rollback
+cargo test --locked --release --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
+# Metal: real Qwen3-0.6B chain over loopback QUIC vs a single process
+cargo test --locked --release --features metal qwen_chain_equals_single_process -- --ignored --nocapture
+```
+
+The other Metal tests (`qwen_cut_2shard`, `qwen_pipelined_chain_equals_greedy`,
+`qwen_pipeline_throughput`, and the single-model tests in `src/qwen/target.rs`) run the same
+way. Metal execution has not been validated since the Luminal migration; see
+[the migration notes](docs/luminal-migration.md).
+
+## Layout
+
+| Path | What it holds |
+|---|---|
+| `src/chain.rs` | The chain config file. |
+| `src/transport.rs` | Wire messages, framing, TLS identities, the handshake, the middle's relay. |
+| `src/node.rs` | The head, middle and tail roles, generic over a shard. |
+| `src/specpipe.rs`, `src/specdecode.rs` | The pipelined driver and the one-chunk-at-a-time reference driver. |
+| `src/qwen/` | Qwen3 on Luminal: graph, CUDA/Metal runtimes, weights, tokenizer, shard, draft. |
+| `docs/luminal-migration.md` | What changed with the current Luminal revision, and what has been validated. |
+| `docs/history/` | Earlier design notes, kept for the reasoning. |
 
 ## Lineage and license
 
-Inspired by [dnet](https://github.com/firstbatchxyz/dnet) and [shard](https://github.com/leyten/shard). Historical design notes remain in `docs/`; the current implementation and migration notes take precedence over earlier proposed APIs and benchmarks.
+Inspired by [dnet](https://github.com/firstbatchxyz/dnet) and
+[shard](https://github.com/leyten/shard).
 
-Apache-2.0. The native runtime/memory adapters are adapted from Luminal's MIT/Apache-2.0 examples at the pinned revision; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+Apache-2.0. The runtime and memory adapters under `src/qwen/runtime/` are adapted from
+Luminal's MIT/Apache-2.0 examples at the pinned revision; see
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
