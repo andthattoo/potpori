@@ -22,15 +22,33 @@ mod cuda_check;
 
 use model::QwenConfig;
 
-/// Map an HF repo name to a known Qwen3 config.
+/// The HF repos this build has a model config for.
+pub const KNOWN_MODELS: [&str; 3] = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"];
+
+/// Map an HF repo name to a known Qwen3 config. Exact match only: a substring match would
+/// hand e.g. `Qwen/Qwen3-14B` the 4B config and fail much later, inside the weight load.
 pub fn config_for(repo: &str) -> Option<QwenConfig> {
-    if repo.contains("0.6B") {
-        Some(QwenConfig::QWEN3_0_6B)
-    } else if repo.contains("1.7B") {
-        Some(QwenConfig::QWEN3_1_7B)
-    } else if repo.contains("4B") {
-        Some(QwenConfig::QWEN3_4B)
-    } else {
-        None
+    match repo {
+        "Qwen/Qwen3-0.6B" => Some(QwenConfig::QWEN3_0_6B),
+        "Qwen/Qwen3-1.7B" => Some(QwenConfig::QWEN3_1_7B),
+        "Qwen/Qwen3-4B" => Some(QwenConfig::QWEN3_4B),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_for_is_exact() {
+        for repo in KNOWN_MODELS {
+            assert!(config_for(repo).is_some(), "{repo}");
+        }
+        assert_eq!(config_for("Qwen/Qwen3-4B").unwrap().layers, 36);
+        assert_eq!(config_for("Qwen/Qwen3-0.6B").unwrap().hidden, 1024);
+        for repo in ["Qwen/Qwen3-14B", "Qwen/Qwen3-4B-Instruct", "qwen/qwen3-4b", "4B", ""] {
+            assert!(config_for(repo).is_none(), "{repo:?} must not match");
+        }
     }
 }

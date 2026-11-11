@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -51,16 +51,17 @@ enum Cmd {
         #[arg(long)]
         model: String,
         /// Global layer range to serve as start:end, e.g. 12:24
-        #[arg(long)]
-        layers: String,
-        /// Role in the chain: "tail" (last shard, owns the lm_head) or "middle"
-        #[arg(long)]
-        role: String,
+        #[arg(long, value_parser = parse_layers)]
+        layers: (usize, usize),
+        /// Role in the chain: tail (last shard, owns the lm_head) or middle
+        #[arg(long, value_enum)]
+        role: Role,
         /// Downstream node address (required for middles)
         #[arg(long)]
         downstream: Option<SocketAddr>,
-        /// Max sequence length — sizes the KV cache (must match the chain config)
-        #[arg(long, default_value_t = 2048)]
+        /// Max sequence length — sizes the KV cache (must match the chain config's max_seq;
+        /// 768 is the validated point and the chain default)
+        #[arg(long, default_value_t = 768)]
         max_seq: usize,
         /// Verify chunk size = γ+1. Compiles chunk-specialized kernels; 0 = generic dynamic
         /// kernel. Metal NEEDS the specialized kernel (the generic multi-token kernel is ~20×
@@ -83,6 +84,35 @@ enum Cmd {
         #[arg(long, default_value_t = 256)]
         max_new: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Role {
+    Middle,
+    Tail,
+}
+
+impl Role {
+    #[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
+    fn name(self) -> &'static str {
+        match self {
+            Role::Middle => "middle",
+            Role::Tail => "tail",
+        }
+    }
+}
+
+/// Parse `--layers start:end` into a non-empty global layer range.
+fn parse_layers(s: &str) -> Result<(usize, usize), String> {
+    let (a, b) = s
+        .split_once(':')
+        .ok_or_else(|| "must be start:end, e.g. 12:24".to_string())?;
+    let a: usize = a.trim().parse().map_err(|e| format!("start {a:?}: {e}"))?;
+    let b: usize = b.trim().parse().map_err(|e| format!("end {b:?}: {e}"))?;
+    if a >= b {
+        return Err(format!("empty layer range {a}:{b} (start must be below end)"));
+    }
+    Ok((a, b))
 }
 
 fn main() -> Result<()> {
@@ -123,11 +153,11 @@ mod run {
     use crate::qwen::shard::Shard;
     use crate::qwen::target::QwenTarget;
     use crate::qwen::tok::ChatTokenizer;
-    use crate::qwen::config_for;
+    use crate::qwen::{config_for, KNOWN_MODELS};
     use crate::specdecode::SpecConfig;
     use crate::specpipe::run_spec_decode_pipelined;
     use crate::transport::listen_endpoint;
-    use crate::Cmd;
+    use crate::{Cmd, Role};
 
     // Backend selection: CUDA wins if both features are enabled.
     #[cfg(feature = "cuda")]
@@ -158,47 +188,59 @@ mod run {
 
     /// Resolve a known Qwen config + prepared (downloaded/combined) weights path.
     fn weights_for(repo: &str) -> Result<(QwenConfig, String)> {
-        let cfg = config_for(repo)
-            .ok_or_else(|| anyhow!("unknown model {repo} — known: Qwen/Qwen3-{{0.6B,1.7B,4B}}"))?;
+        let cfg = known_config(repo)?;
         tracing::info!("preparing weights for {repo} (downloads + combines on first run)…");
         let dir = prepare_hf_model(repo).map_err(|e| anyhow!("prepare {repo}: {e}"))?;
         Ok((cfg, dir.join("model_combined_bf16_v1.safetensors").to_string_lossy().into_owned()))
     }
 
-    fn parse_layers(s: &str) -> Result<(usize, usize)> {
-        let (a, b) = s
-            .split_once(':')
-            .ok_or_else(|| anyhow!("--layers must be start:end, e.g. 12:24"))?;
-        Ok((a.trim().parse()?, b.trim().parse()?))
+    /// Resolve a model config without touching the network (cheap; for early validation).
+    fn known_config(repo: &str) -> Result<QwenConfig> {
+        config_for(repo)
+            .ok_or_else(|| anyhow!("unknown model {repo:?} — known: {}", KNOWN_MODELS.join(", ")))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn serve(
         listen: SocketAddr,
         model: String,
-        layers: String,
-        role: String,
+        (a, b): (usize, usize),
+        role: Role,
         downstream: Option<SocketAddr>,
         max_seq: usize,
         chunk: usize,
         search_graphs: usize,
     ) -> Result<()> {
-        let (a, b) = parse_layers(&layers)?;
-        let is_last = match role.as_str() {
-            "tail" => true,
-            "middle" => false,
-            r => bail!("--role must be tail or middle, got {r}"),
-        };
-        let (cfg, wp) = weights_for(&model)?;
+        let is_last = role == Role::Tail;
+        let role = role.name();
+        // Validate everything cheap before the download + kernel search.
+        let cfg = known_config(&model)?;
         if a == 0 {
             bail!("layer 0 belongs to the head — run `potpori chat` on the head instead");
         }
         if is_last && b != cfg.layers {
             bail!("tail must end at the last layer ({}), got {b}", cfg.layers);
         }
+        if !is_last && b >= cfg.layers {
+            bail!(
+                "a middle must end before the last layer ({}), got {b} — the shard that ends \
+                 there is the tail (--role tail)",
+                cfg.layers
+            );
+        }
         if !is_last && downstream.is_none() {
             bail!("--downstream is required for middles");
         }
+        if is_last && downstream.is_some() {
+            bail!("--downstream is only for middles (the tail is the end of the chain)");
+        }
+        if chunk == 1 {
+            bail!("--chunk must be 0 (generic kernel) or gamma+1 >= 2");
+        }
+        if chunk >= max_seq {
+            bail!("--chunk ({chunk}) must be smaller than --max-seq ({max_seq})");
+        }
+        let (cfg, wp) = weights_for(&model)?;
 
         tracing::info!("loading shard [{a},{b}) of {model} — egglog kernel search, takes minutes…");
         let mut shard = Shard::load_chunked(
@@ -237,7 +279,11 @@ mod run {
 
     fn chat(chain_path: PathBuf, prompt: String, max_new: usize) -> Result<()> {
         let cc = ChainConfig::load(&chain_path)?;
-        let chunk = cc.gamma + 1;
+        let chunk = cc.chunk();
+        // Cheap plan checks first, so config errors surface before the slow loads.
+        cc.check_layers(known_config(&cc.model)?.layers)?;
+        known_config(&cc.draft_model)?;
+        let next_addr = cc.remote_addr(1)?;
 
         // Tokenize first (fast) so config errors surface before the slow loads.
         let tok = ChatTokenizer::load(&cc.model)?;
@@ -289,11 +335,6 @@ mod run {
             tracing::info!("draft sanity check ok (first prediction = {})", probe[0]);
         }
 
-        let next_addr: SocketAddr = cc.nodes[1]
-            .addr
-            .as_ref()
-            .expect("validated: remote nodes have addrs")
-            .parse()?;
         tracing::info!("prompt = {} tokens; dialing {next_addr}…", ids.len());
         let mut chain = PipelinedQuicChain::connect(vec![head], next_addr)
             .map_err(|e| anyhow!("dial {next_addr}: {e}"))?;
@@ -322,5 +363,46 @@ mod run {
             cc.nodes.len(),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn layers_parse() {
+        assert_eq!(parse_layers("12:24"), Ok((12, 24)));
+        assert_eq!(parse_layers(" 0 : 1 "), Ok((0, 1)));
+        for bad in ["12", "12-24", "24:12", "5:5", "a:3", "3:", ":"] {
+            assert!(parse_layers(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn serve_args() {
+        let serve = |extra: &[&str]| {
+            let mut args = vec!["potpori", "serve", "--listen", "0.0.0.0:4010", "--model", "Qwen/Qwen3-4B"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        match serve(&["--layers", "24:36", "--role", "tail"]).unwrap().cmd {
+            Cmd::Serve { layers, role, max_seq, chunk, downstream, .. } => {
+                assert_eq!(layers, (24, 36));
+                assert_eq!(role, Role::Tail);
+                assert_eq!(max_seq, 768, "must match ChainConfig's default max_seq");
+                assert_eq!(chunk, 8, "must match ChainConfig's default gamma + 1");
+                assert!(downstream.is_none());
+            }
+            _ => panic!("expected serve"),
+        }
+        assert!(serve(&["--layers", "24:36", "--role", "head"]).is_err());
+        assert!(serve(&["--layers", "36:24", "--role", "tail"]).is_err());
     }
 }
