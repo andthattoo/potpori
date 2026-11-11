@@ -42,6 +42,8 @@ pub struct Shard<R: QwenRuntime> {
     is_last: bool,
     n_layers: usize,
     max_seq_len: usize,
+    /// 0 = generic dynamic `s` bucket; >0 = only the point buckets `s ∈ {1, chunk_size}` exist.
+    chunk_size: usize,
 }
 
 impl<R: QwenRuntime + 'static> Shard<R> {
@@ -148,12 +150,42 @@ impl<R: QwenRuntime + 'static> Shard<R> {
             is_last,
             n_layers,
             max_seq_len,
+            chunk_size,
         }
+    }
+
+    /// Whether a chunk of `s` positions starting at absolute `start_pos` can run on this shard:
+    /// a compiled kernel bucket exists for `s`, and every position fits in the KV cache. Past
+    /// `max_seq` the KV scatter would write out of range on the GPU, so serve loops check this
+    /// on every (untrusted) inbound frame.
+    pub fn check_chunk(&self, start_pos: u32, s: usize) -> Result<(), String> {
+        if s == 0 {
+            return Err("empty chunk (0 tokens)".into());
+        }
+        if self.chunk_size > 0 && s != 1 && s != self.chunk_size {
+            return Err(format!(
+                "no kernel for a {s}-token chunk: this shard was compiled for 1 or {} tokens \
+                 (--chunk must equal the chain's gamma+1 on every node)",
+                self.chunk_size
+            ));
+        }
+        let end = start_pos as usize + s;
+        if end > self.max_seq_len {
+            return Err(format!(
+                "chunk [{start_pos}, {end}) exceeds this shard's max_seq {}",
+                self.max_seq_len
+            ));
+        }
+        Ok(())
     }
 
     /// Run `s` positions starting at absolute `start_pos`; advance the KV; return the output
     /// (`[s, vocab]` logits if last shard, else `[s, hidden]` residual stream) flattened.
     fn run_chunk(&mut self, start_pos: u32, s: usize, input: ShardInput) -> Vec<f32> {
+        // Last line of defence — callers validate first (`check_chunk`, `check_context`).
+        if let Err(e) = self.check_chunk(start_pos, s) {
+            panic!("refusing to run chunk: {e}");
+        }
         self.cx.set_dim('s', s);
         self.cx.set_dim('p', start_pos as usize);
         match input {
@@ -201,6 +233,10 @@ impl<R: QwenRuntime + 'static> Shard<R> {
 
     pub fn hidden_dim(&self) -> usize {
         self.cfg.hidden
+    }
+
+    pub fn max_seq(&self) -> usize {
+        self.max_seq_len
     }
 
     pub fn is_last(&self) -> bool {

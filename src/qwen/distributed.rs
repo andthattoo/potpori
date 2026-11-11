@@ -151,6 +151,29 @@ impl<R: QwenRuntime + 'static> TargetChain for RemoteChain<R> {
     }
 }
 
+/// Validate an inbound (untrusted) hidden-state frame against this shard before it reaches the
+/// GPU: codec, shape, payload length, kernel bucket and KV bounds.
+fn check_frame<R: QwenRuntime + 'static>(shard: &Shard<R>, frame: &HiddenStateFrame) -> io::Result<()> {
+    let bad = |msg: String| io::Error::new(io::ErrorKind::InvalidData, format!("bad frame: {msg}"));
+    if frame.dtype != "f32" {
+        return Err(bad(format!("unsupported codec {:?} (only f32)", frame.dtype)));
+    }
+    let hidden = shard.hidden_dim();
+    if frame.hidden_dim as usize != hidden {
+        return Err(bad(format!(
+            "hidden_dim {} != this shard's {hidden} (different model upstream?)",
+            frame.hidden_dim
+        )));
+    }
+    let s = frame.n_tokens as usize;
+    shard.check_chunk(frame.start_pos, s).map_err(bad)?;
+    let want = s * hidden * 4;
+    if frame.data.len() != want {
+        return Err(bad(format!("payload is {} bytes, expected {want} for {s} tokens", frame.data.len())));
+    }
+    Ok(())
+}
+
 /// Run the tail: own `shard` (the last shard) on this thread, accept one inbound peer, and serve
 /// hidden→argmax over the QUIC link until the head closes. The Luminal runtime stays on this
 /// thread (the serve future is `block_on`'d, never spawned); the quinn endpoint's I/O driver runs
@@ -167,6 +190,7 @@ pub fn serve_tail<R: QwenRuntime + 'static>(
         while let Some(msg) = peer.recv().await? {
             match msg {
                 PeerMessage::Hidden(frame) => {
+                    check_frame(shard, &frame)?;
                     let s = frame.n_tokens as usize;
                     let hidden = frame.to_f32();
                     let logits = shard.forward_hidden(frame.start_pos, s, hidden); // sync GPU
@@ -213,6 +237,7 @@ pub fn serve_middle<R: QwenRuntime + 'static>(
                 PeerMessage::Truncate(_) => continue,
                 PeerMessage::Result(_) => break,
             };
+            check_frame(shard, &frame)?;
             let s = frame.n_tokens as usize;
             let out = shard.forward_hidden(frame.start_pos, s, frame.to_f32()); // sync GPU
             req += 1;

@@ -68,6 +68,30 @@ impl ChainConfig {
         Ok(cfg)
     }
 
+    /// KV positions a generation can touch: the prompt, up to `max_new` committed tokens, and
+    /// up to `depth` speculative chunks of `gamma` tokens in flight past the committed boundary.
+    /// (The driver grid test asserts the drivers never feed a position beyond this.)
+    pub fn positions_needed(&self, prompt_tokens: usize, max_new: usize) -> usize {
+        prompt_tokens + max_new + self.depth.max(1) * self.gamma.max(1)
+    }
+
+    /// Fail before the slow loads if this generation cannot fit in every shard's KV cache —
+    /// past `max_seq` the KV scatter would write out of range on the GPU.
+    pub fn check_context(&self, prompt_tokens: usize, max_new: usize) -> Result<()> {
+        let need = self.positions_needed(prompt_tokens, max_new);
+        if need > self.max_seq {
+            let spec = self.depth.max(1) * self.gamma.max(1);
+            bail!(
+                "context does not fit: {prompt_tokens} prompt tokens + {max_new} max_new + {spec} \
+                 speculative (depth x gamma) = {need} positions, but max_seq is {}. Shorten the \
+                 prompt, lower --max-new (at most {} here), or raise max_seq on every node.",
+                self.max_seq,
+                self.max_seq.saturating_sub(prompt_tokens + spec),
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.nodes.len() < 2 {
             bail!("a chain needs at least 2 nodes (a local head + a remote tail)");
@@ -122,6 +146,30 @@ mod tests {
         assert_eq!(cfg.gamma, 7);
         assert_eq!(cfg.draft_model, "Qwen/Qwen3-0.6B");
         assert_eq!(cfg.nodes.len(), 3);
+    }
+
+    #[test]
+    fn context_bound() {
+        let cfg: ChainConfig = toml::from_str(
+            r#"
+            model = "Qwen/Qwen3-4B"
+            max_seq = 768
+            gamma = 7
+            depth = 4
+            [[nodes]]
+            layers = [0, 18]
+            [[nodes]]
+            addr = "1.2.3.4:4010"
+            layers = [18, 36]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.positions_needed(100, 256), 100 + 256 + 28);
+        cfg.check_context(100, 256).unwrap();
+        cfg.check_context(100, 640).unwrap(); // exactly 768
+        let err = cfg.check_context(100, 641).unwrap_err().to_string();
+        assert!(err.contains("max_seq is 768") && err.contains("at most 640"), "{err}");
+        assert!(cfg.check_context(800, 1).is_err());
     }
 
     #[test]

@@ -242,6 +242,7 @@ mod run {
         // Tokenize first (fast) so config errors surface before the slow loads.
         let tok = ChatTokenizer::load(&cc.model)?;
         let ids = tok.encode_chat(&prompt)?;
+        cc.check_context(ids.len(), max_new)?;
 
         let (dcfg, dwp) = weights_for(&cc.draft_model)?;
         tracing::info!("loading draft model {}…", cc.draft_model);

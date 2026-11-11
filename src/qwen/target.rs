@@ -191,6 +191,13 @@ impl<R: QwenRuntime + 'static> QwenTarget<R> {
     /// the per-position logits as `[s, VOCAB]` flattened.
     fn run_chunk(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<f32> {
         let s = tokens.len();
+        // Past max_seq the KV scatter would write out of range on the GPU.
+        assert!(
+            s > 0 && start_pos as usize + s <= self.max_seq_len,
+            "chunk [{start_pos}, {}) does not fit max_seq {}",
+            start_pos as usize + s,
+            self.max_seq_len
+        );
         self.cx.set_dim('s', s);
         self.cx.set_dim('p', start_pos as usize);
         self.runtime.set_i32_data(self.input.id, tokens.to_vec());

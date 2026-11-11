@@ -280,7 +280,7 @@ mod tests {
     }
     impl Oracle {
         fn next(&self, prefix: &[TokenId]) -> TokenId {
-            let generated = prefix.len() - self.prompt_len;
+            let generated = prefix.len().saturating_sub(self.prompt_len);
             if self.eos_at.is_some_and(|e| generated >= e) {
                 return self.eos;
             }
@@ -311,11 +311,13 @@ mod tests {
     struct KvPipe {
         oracle: Oracle,
         kv: Vec<TokenId>,
+        /// High-water mark: one past the highest absolute position ever fed.
+        positions_used: usize,
         q: VecDeque<Vec<TokenId>>,
     }
     impl KvPipe {
         fn new(oracle: Oracle) -> Self {
-            Self { oracle, kv: Vec::new(), q: VecDeque::new() }
+            Self { oracle, kv: Vec::new(), positions_used: 0, q: VecDeque::new() }
         }
         fn feed(&mut self, start_pos: u32, tokens: &[TokenId]) -> Vec<TokenId> {
             let start = start_pos as usize;
@@ -326,6 +328,7 @@ mod tests {
                 self.kv.push(t);
                 out.push(self.oracle.next(&self.kv));
             }
+            self.positions_used = self.positions_used.max(self.kv.len());
             out
         }
     }
@@ -480,6 +483,12 @@ mod tests {
                         );
                         assert_eq!(stats.committed, out.len());
                         assert!(c.q.is_empty(), "driver left chunks in flight");
+                        // The bound `ChainConfig::positions_needed` relies on.
+                        assert!(
+                            c.positions_used <= prompt.len() + max_new + depth * gamma,
+                            "fed {} positions > bound (gamma={gamma} depth={depth})",
+                            c.positions_used
+                        );
                         cases += 1;
                     }
                 }
