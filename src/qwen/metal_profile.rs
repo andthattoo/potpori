@@ -136,23 +136,16 @@ fn metal_profile() {
         ("last layer + output head", (l - 1, l)),
     ];
     let mut plans = Vec::new();
-    // The same shards with each way of writing a linear layer (see `model::LinearForm`).
-    for form in ["turned", "rows", "plain"] {
-        std::env::set_var("POTPORI_LINEAR", form);
-        for (name, range) in cases {
-            let mut shard = load(range, 512);
-            for (rows, context) in [(1, 16), (CHUNK, 16), (1, 500), (CHUNK, 500)] {
-                let [total, upload, kernels, readback] = time(&mut shard, rows, context);
-                println!(
-                    "{form:6} {name:26} rows {rows} context {context:3}: {total:7.2} = \
-                     {upload:6.2} + {kernels:7.2} + {readback:6.2}"
-                );
-            }
-            plans.push((
-                format!("{form}: {name}"),
-                shard.describe().unwrap_or_default(),
-            ));
+    for (name, range) in cases {
+        let mut shard = load(range, 512);
+        for (rows, context) in [(1, 16), (CHUNK, 16), (1, 500), (CHUNK, 500)] {
+            let [total, upload, kernels, readback] = time(&mut shard, rows, context);
+            println!(
+                "{name:26} rows {rows} context {context:3}: {total:7.2} = {upload:6.2} + \
+                 {kernels:7.2} + {readback:6.2}"
+            );
         }
+        plans.push((name, shard.describe().unwrap_or_default()));
     }
 
     println!("\n== 3. Compiled plans ==");

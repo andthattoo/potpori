@@ -57,6 +57,43 @@ impl Allocation {
             )
         })
     }
+    /// Several small uploads in one command buffer: one wait for all of them, where
+    /// [`Self::write`] waits for each. A step has five or more inputs.
+    pub fn write_all(&mut self, parts: &[(usize, &[u8])]) -> Result<()> {
+        objc::rc::autoreleasepool(|| {
+            let command = self.queue.new_command_buffer();
+            let blit = command.new_blit_command_encoder();
+            // The staging buffers must outlive the copies.
+            let mut staged = Vec::with_capacity(parts.len());
+            for &(offset, data) in parts {
+                let end = offset
+                    .checked_add(data.len())
+                    .ok_or_else(|| anyhow!("upload range overflow"))?;
+                ensure!(
+                    end as u64 <= self.buffer.length(),
+                    "upload exceeds allocation"
+                );
+                if data.is_empty() {
+                    continue;
+                }
+                let staging = self.device.new_buffer_with_data(
+                    data.as_ptr().cast(),
+                    data.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                blit.copy_from_buffer(&staging, 0, &self.buffer, offset as u64, data.len() as u64);
+                staged.push(staging);
+            }
+            blit.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            ensure!(
+                command.status() == MTLCommandBufferStatus::Completed,
+                "Metal upload failed"
+            );
+            Ok(())
+        })
+    }
     pub fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
         let end = offset
             .checked_add(data.len())

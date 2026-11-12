@@ -156,12 +156,18 @@ impl MetalBackend {
         runtime.set_dim('q', query);
         runtime.set_dim('c', context);
         let t0 = std::time::Instant::now();
+        let mut uploads = Vec::with_capacity(inputs.len());
         for (id, value) in inputs {
             let data = host(value);
             let range = runtime.input_arena_range(id)?;
             ensure!(range.bytes == data.bytes.len(), "step input size mismatch");
-            self.arena.write(range.offset, &data.bytes)?;
+            uploads.push((range.offset, data.bytes));
         }
+        let parts: Vec<(usize, &[u8])> = uploads
+            .iter()
+            .map(|(offset, bytes)| (*offset, bytes.as_slice()))
+            .collect();
+        self.arena.write_all(&parts)?;
         let t1 = std::time::Instant::now();
         let launched = |runtime: &MetalRuntime| runtime.graph_stats().map_or(0, |s| s.launches);
         let before = launched(runtime);

@@ -84,12 +84,8 @@ pub type Inputs = FxHashMap<NodeIndex, TensorData>;
 pub struct Parameter {
     pub input: NodeIndex,
     pub name: String,
-    /// Shape in the checkpoint.
     pub shape: Vec<usize>,
     pub dtype: DType,
-    /// The graph holds this matrix transposed, `[in, out]`: it is turned at load, so that a
-    /// linear layer is a plain matmul and no kernel has to turn it on every call.
-    pub transpose: bool,
 }
 #[derive(Clone)]
 pub struct StateBinding {
@@ -143,20 +139,15 @@ pub fn matrix_dtype() -> DType {
     }
 }
 
-fn parameter(
+/// A checkpoint tensor, in the checkpoint's orientation.
+pub(super) fn weight(
     cx: &mut Graph,
     params: &mut Vec<Parameter>,
     name: String,
     shape: Vec<usize>,
-    transpose: bool,
 ) -> GraphTensor {
-    let held = if transpose {
-        shape.iter().rev().copied().collect()
-    } else {
-        shape.clone()
-    };
     // F32 arithmetic, with the matrix's device storage declared explicitly.
-    let port = cx.named_tensor(&name, held, DType::F32);
+    let port = cx.named_tensor(&name, shape.clone(), DType::F32);
     let dtype = if name.contains("norm") {
         DType::F32
     } else {
@@ -168,70 +159,20 @@ fn parameter(
         name,
         shape,
         dtype,
-        transpose,
     });
     port
 }
 
-/// A checkpoint tensor in the checkpoint's own orientation: norm vectors, embedding tables.
-pub(super) fn weight(
-    cx: &mut Graph,
-    params: &mut Vec<Parameter>,
-    name: String,
-    shape: Vec<usize>,
-) -> GraphTensor {
-    parameter(cx, params, name, shape, false)
-}
-
-/// How a linear layer `y = x · Wᵀ` is written in the graph. The kernels Luminal generates
-/// run one thread per output element, so the form decides what each thread reads.
-#[derive(Clone, Copy, PartialEq)]
-pub(super) enum LinearForm {
-    /// `W` turned at load to `[in, out]`; `x.matmul(W)`.
-    Turned,
-    /// `W` as in the checkpoint; `W.matmul(xᵀ)ᵀ`: a thread reads one contiguous row of `W`,
-    /// and the threads for a chunk's rows read the same one.
-    Rows,
-    /// `W` as in the checkpoint; `x.matmul(Wᵀ)`.
-    Plain,
-}
-
-pub(super) fn linear_form() -> LinearForm {
-    match std::env::var("POTPORI_LINEAR").as_deref() {
-        Ok("rows") => LinearForm::Rows,
-        Ok("plain") => LinearForm::Plain,
-        _ => LinearForm::Turned,
-    }
-}
-
-/// The matrix of a linear layer, `[out, in]` in the checkpoint (`shape`). Apply it with
-/// [`linear`].
-pub(super) fn linear_weight(
-    cx: &mut Graph,
-    params: &mut Vec<Parameter>,
-    name: String,
-    shape: Vec<usize>,
-) -> GraphTensor {
-    assert_eq!(shape.len(), 2, "a linear layer's weight is a matrix");
-    parameter(cx, params, name, shape, linear_form() == LinearForm::Turned)
-}
-
-/// Apply a [`linear_weight`] to rows `x`.
+/// A linear layer `x · Wᵀ` for rows `x` and a checkpoint matrix `W` of `[out, in]` — also the
+/// tied output head, with the embedding table as `W`.
+///
+/// Written as `(W · xᵀ)ᵀ` on purpose. Luminal's kernels run one thread per output element;
+/// in this form a thread reads one contiguous row of `W`, and the threads for the rows of a
+/// chunk sit next to each other and read the same one. The textbook `x.matmul(W.t())` makes
+/// every row of the chunk walk the whole matrix again: on Metal the output head of a
+/// chunk of eight took six times as long.
 pub(super) fn linear(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    match linear_form() {
-        LinearForm::Turned => x.matmul(w),
-        LinearForm::Rows => w.matmul(x.t()).t(),
-        LinearForm::Plain => x.matmul(w.t()),
-    }
-}
-
-/// Logits of rows `x` against an embedding table in the checkpoint's `[vocab, hidden]`
-/// orientation (the tied output head).
-pub(super) fn project(x: GraphTensor, table: GraphTensor) -> GraphTensor {
-    match linear_form() {
-        LinearForm::Rows => table.matmul(x.t()).t(),
-        _ => x.matmul(table.t()),
-    }
+    w.matmul(x.t()).t()
 }
 
 impl QwenGraph {
@@ -267,25 +208,15 @@ impl QwenGraph {
         let sin = cx.tensor(vec![IntExpr::from('q'), cfg.head_dim.into()], DType::F32);
         let rotation = cx.tensor(vec![cfg.head_dim, cfg.head_dim], DType::F32);
         let mut parameters = Vec::new();
-        // The embedding table is also the output head. A shard that only needs the head
-        // holds the table turned, like any linear layer; the whole model in one shard needs
-        // both orientations and keeps the checkpoint's.
-        let table = |cx: &mut Graph, parameters: &mut Vec<Parameter>, turned: bool| {
-            let name = "model.embed_tokens.weight".to_string();
-            let shape = vec![cfg.vocab_size, cfg.hidden];
-            if turned {
-                linear_weight(cx, parameters, name, shape)
-            } else {
-                weight(cx, parameters, name, shape)
-            }
-        };
-        let embedding = first.then(|| table(&mut cx, &mut parameters, false));
-        // (the output head, and whether it is a `linear_weight` or a plain table)
-        let head = match (last, embedding) {
-            (false, _) => None,
-            (true, Some(embedding)) => Some((embedding, false)),
-            (true, None) => Some((table(&mut cx, &mut parameters, true), true)),
-        };
+        // The embedding table is also the output head.
+        let embedding = (first || last).then(|| {
+            weight(
+                &mut cx,
+                &mut parameters,
+                "model.embed_tokens.weight".into(),
+                vec![cfg.vocab_size, cfg.hidden],
+            )
+        });
         let mut x = if first {
             luminal_nn::embedding(input, embedding.unwrap())
         } else {
@@ -293,13 +224,13 @@ impl QwenGraph {
         };
         let mut state = Vec::new();
         for l in range.0..range.1 {
-            let mut w = |suffix: &str, shape: Vec<usize>| {
-                let name = format!("model.layers.{l}.{suffix}.weight");
-                if shape.len() == 2 {
-                    linear_weight(&mut cx, &mut parameters, name, shape)
-                } else {
-                    weight(&mut cx, &mut parameters, name, shape)
-                }
+            let mut w = |suffix: &str, shape| {
+                weight(
+                    &mut cx,
+                    &mut parameters,
+                    format!("model.layers.{l}.{suffix}.weight"),
+                    shape,
+                )
             };
             let attn_norm = w("input_layernorm", vec![cfg.hidden]);
             let wq = w("self_attn.q_proj", vec![cfg.q_dim(), cfg.hidden]);
@@ -354,19 +285,17 @@ impl QwenGraph {
             let normed = luminal_nn::rms_norm(x, Some(ffn_norm), None, cfg.rms_norm_eps);
             x += linear(linear(normed, gate).silu() * linear(normed, up), down);
         }
-        if let Some((head, is_linear)) = head {
+        if last {
             let norm = weight(
                 &mut cx,
                 &mut parameters,
                 "model.norm.weight".into(),
                 vec![cfg.hidden],
             );
-            let normed = luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps);
-            x = if is_linear {
-                linear(normed, head)
-            } else {
-                project(normed, head)
-            };
+            x = linear(
+                luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps),
+                embedding.unwrap(),
+            );
         }
         Ok(Self {
             graph: cx,
