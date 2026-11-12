@@ -149,8 +149,8 @@ GPU tests are `#[ignore]`d and run by name:
 cargo test --locked --release --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
 # Metal: real Qwen3-0.6B chain over loopback QUIC vs a single process
 cargo test --locked --release --features metal qwen_chain_equals_single_process -- --ignored --nocapture
-# Either backend: Qwen3-4B with its DSpark drafter over loopback QUIC vs greedy (11 GB download)
-cargo test --locked --release --features metal dspark_loopback -- --ignored --nocapture
+# Either backend: Qwen3-4B, then its DSpark drafter on the features it produced (11 GB download)
+cargo test --locked --release --features metal dspark_on_real_weights -- --ignored --nocapture
 ```
 
 The other Metal tests (`qwen_cut_2shard`, `qwen_pipelined_chain_equals_greedy`,

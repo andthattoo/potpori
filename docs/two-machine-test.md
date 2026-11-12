@@ -105,7 +105,7 @@ Also note which machine was the head and which backend each side ran.
 ## 6. The same run with a DSpark drafter
 
 A [DSpark drafter](dspark.md) replaces the draft model. Check it on one machine first
-(`dspark_loopback` in the README), then:
+(`dspark_on_real_weights` in the README), then:
 
 - restart the tail with `--taps 1,9,17,25,33` added to the command in step 3;
 - add `drafter = "deepseek-ai/dspark_qwen3_4b_block7"` to `chain.toml` on the head.

@@ -216,15 +216,18 @@ potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
 the size of the tapped layers per result. Remove the `drafter` line (and `--taps`) to run
 the same prompt with the small draft model.
 
-**Start on one machine.** This runs the whole path — both halves of Qwen3-4B, the drafter,
-QUIC over loopback — checks the output against plain greedy decoding through the same
-chain, and prints tokens per trip for three prompts:
+**Start on one machine.** This runs Qwen3-4B, cut at the tapped layers as on a chain, and
+then the published drafter on the features it produced, and prints tokens per trip for
+three prompts:
 
 ```sh
-cargo test --release --features metal dspark_loopback -- --ignored --nocapture   # or cuda
+cargo test --release --features metal dspark_on_real_weights -- --ignored --nocapture   # or cuda
 ```
 
-It downloads about 11 GB and runs seven kernel searches, so the first run takes a while.
+The target and the drafter run one after the other, because together they do not fit on a
+32 GB Mac (about 21 GB of 32-bit weights). A position's features do not depend on later
+tokens, so replaying the target's greedy output gives the accepted lengths a live chain
+would see. It downloads about 11 GB and runs seven kernel searches.
 
 ### What has been checked, and what has not
 
@@ -243,7 +246,7 @@ any shard, but the graph has operations in a new combination (attention without 
 row gather before the output head), and kernel search for it has never run. The published
 checkpoint has not been loaded: the tests use a checkpoint written by DeepSpec's own model
 class at tiny size, so the tensor names and layout match, but the 2.8 GB file is untested.
-`dspark_loopback` covers both.
+`dspark_on_real_weights` covers both.
 
 ### Which is better
 
