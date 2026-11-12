@@ -116,6 +116,14 @@ fn time(shard: &mut Shard<MetalRuntime>, rows: usize, context: usize) -> [f64; 4
     ]
 }
 
+/// The same profile with 16-bit weight storage: half the memory, plus a cast per call.
+#[test]
+#[ignore = "needs Metal and downloads Qwen3-0.6B"]
+fn metal_f16_profile() {
+    std::env::set_var("POTPORI_WEIGHT_DTYPE", "f16");
+    metal_profile();
+}
+
 #[test]
 #[ignore = "needs Metal and downloads Qwen3-0.6B"]
 fn metal_profile() {
