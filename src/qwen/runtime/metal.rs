@@ -47,6 +47,20 @@ pub fn bindings(graph: &LlmGraph) -> MetalBindings {
     bindings
 }
 
+/// Luminal's Metal kernels, minus any named in `POTPORI_METAL_WITHOUT` (comma-separated
+/// labels such as `IndexMapApplyMaterialize`) — an experiment knob: the planner chooses per
+/// site between kernels that read through a view and kernels that first copy their operand.
+fn registry() -> Vec<luminal_metal::RegisteredOp> {
+    let without = std::env::var("POTPORI_METAL_WITHOUT").unwrap_or_default();
+    let dropped: Vec<&str> = without.split(',').filter(|s| !s.is_empty()).collect();
+    luminal_metal::metal_registry_filtered(|op| !dropped.contains(&op.label()))
+}
+
+/// The labels of every kernel kind the planner can choose from.
+pub fn kernel_kinds() -> Vec<&'static str> {
+    metal_registry().iter().map(|op| op.label()).collect()
+}
+
 pub type BucketPlan =
     crate::qwen::model::BucketPlan<luminal_metal::layouts::MetalPlan, luminal_metal::SearchOutcome>;
 
@@ -80,9 +94,8 @@ impl MetalBackend {
             for (id, value) in graph.profile_inputs(q, c)? {
                 data.insert(id, host(value));
             }
-            let mut runtime =
-                MetalRuntime::load_with(&graph.graph, bindings(graph), metal_registry())?
-                    .with_device(&device)?;
+            let mut runtime = MetalRuntime::load_with(&graph.graph, bindings(graph), registry())?
+                .with_device(&device)?;
             let outcome = runtime.search(spec.bounds(), spec.profile_dims(), &data, options)?;
             let scratch_bytes = runtime.arena_bytes()?;
             let resource_bindings = resources
