@@ -123,12 +123,7 @@ fn time(shard: &mut Shard<MetalRuntime>, rows: usize, context: usize) -> [f64; 4
 fn metal_without_copies() {
     println!("kernel kinds: {:?}", super::runtime::metal_kernel_kinds());
     let l = CFG.layers;
-    for without in [
-        "",
-        "IndexMapApplyMaterialize",
-        "MaterializeLayoutCopy",
-        "IndexMapApplyMaterialize,MaterializeLayoutCopy",
-    ] {
+    for without in ["CopyGeneric", "CopyGeneric,IndexMapApplyMaterialize"] {
         std::env::set_var("POTPORI_METAL_WITHOUT", without);
         for (name, range) in [
             ("4 layers", (1, 5)),
@@ -147,7 +142,10 @@ fn metal_without_copies() {
                 );
             }
             let plan = shard.describe().unwrap_or_default();
-            for line in plan.lines().filter(|l| l.starts_with("bucket")) {
+            for line in plan
+                .lines()
+                .filter(|l| !l.contains("buffer") && !l.contains("0.00 MiB"))
+            {
                 println!("    {line}");
             }
         }
