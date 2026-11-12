@@ -53,10 +53,17 @@ pub struct CandleShard {
     sin: Tensor,
 }
 
-/// The device a candle shard runs on: the first CUDA GPU when built with `candle-cuda` and
-/// one is present, else the CPU.
+/// The device a candle shard runs on: the GPU the build names (`candle-metal`, else
+/// `candle-cuda`), or the CPU for a plain `candle` build. A GPU build that cannot open its
+/// device panics rather than run on the CPU unnoticed.
 pub fn default_device() -> Device {
-    Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+    if cfg!(feature = "candle-metal") {
+        Device::new_metal(0).expect("open the Metal device")
+    } else if cfg!(feature = "candle-cuda") {
+        Device::new_cuda(0).expect("open the first CUDA device")
+    } else {
+        Device::Cpu
+    }
 }
 
 impl CandleShard {

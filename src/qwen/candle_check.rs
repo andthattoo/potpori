@@ -2,8 +2,8 @@
 //!
 //! `candle_tiny_shards_and_rollback` runs on the CPU with a generated model, against the same
 //! scalar reference as the Luminal backends (`cargo test --features candle candle_tiny`).
-//! The rest load Qwen3-0.6B and run on the GPU with `candle-cuda` (CPU otherwise) — all
-//! `#[ignore]`:
+//! The rest run on the GPU with `candle-cuda` or `candle-metal` (CPU with plain `candle`) and,
+//! but for `candle_tiny_gpu_shards_and_rollback`, load Qwen3-0.6B — all `#[ignore]`:
 //!
 //!   cargo test --release --features candle-cuda candle_ -- --ignored --nocapture --test-threads 1
 //!
@@ -45,6 +45,18 @@ type Link = ChainLink<CandleShard>;
 fn candle_tiny_shards_and_rollback() {
     super::tiny::check_shards_and_rollback(|cfg, range, path| {
         CandleShard::load(cfg, range, path, 8, 2, &Device::Cpu, DType::F32).unwrap()
+    });
+}
+
+// The same tiny-model check on the build's GPU: every operation the shard uses, in seconds
+// and with no download. The first thing to run on a new backend.
+#[test]
+#[ignore = "a GPU with candle-cuda or candle-metal"]
+fn candle_tiny_gpu_shards_and_rollback() {
+    let device = default_device();
+    println!("[candle] tiny model on {:?}", device.location());
+    super::tiny::check_shards_and_rollback(|cfg, range, path| {
+        CandleShard::load(cfg, range, path, 8, 2, &device, DType::F32).unwrap()
     });
 }
 

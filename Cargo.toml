@@ -32,10 +32,11 @@ metal = ["dep:luminal_metal", "dep:metal", "dep:objc", "engine"]
 # Luminal's CPU reference executor: slow, exact, no GPU. Tests only — it runs the real graphs
 # on tiny models, so graph changes can be checked anywhere.
 reference = ["dep:luminal_reference", "engine"]
-# Prototype: Qwen shards on candle instead of Luminal (CPU; `candle-cuda` for NVIDIA). Same
+# Prototype: Qwen shards on candle instead of Luminal (CPU; `candle-cuda` for NVIDIA, `candle-metal` for Apple). Same
 # ShardEngine contract, so candle and Luminal nodes can share a chain. Tests only so far.
 candle = ["dep:candle-core", "dep:candle-nn", "engine"]
 candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
+candle-metal = ["candle", "candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
