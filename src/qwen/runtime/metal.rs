@@ -11,9 +11,7 @@ use luminal::{
     memory::{PersistentBinding, ProgramMemory, ResourceId, SharedArenaPlan},
 };
 use luminal_metal::device::ExternalBuffer;
-use luminal_metal::{
-    bindings::MetalBindings, metal_registry, CompileOptions, HostBuffer, MetalRuntime,
-};
+use luminal_metal::{bindings::MetalBindings, CompileOptions, HostBuffer, MetalRuntime};
 
 /// THE BINDING IS THE STATEMENT. The chat graph says nothing about
 /// boundaries; this says all of it:
@@ -47,18 +45,15 @@ pub fn bindings(graph: &LlmGraph) -> MetalBindings {
     bindings
 }
 
-/// Luminal's Metal kernels, minus any named in `POTPORI_METAL_WITHOUT` (comma-separated
-/// labels such as `IndexMapApplyMaterialize`) — an experiment knob: the planner chooses per
-/// site between kernels that read through a view and kernels that first copy their operand.
-fn registry() -> Vec<luminal_metal::RegisteredOp> {
-    let without = std::env::var("POTPORI_METAL_WITHOUT").unwrap_or_default();
-    let dropped: Vec<&str> = without.split(',').filter(|s| !s.is_empty()).collect();
-    luminal_metal::metal_registry_filtered(|op| !dropped.contains(&op.label()))
-}
-
-/// The labels of every kernel kind the planner can choose from.
-pub fn kernel_kinds() -> Vec<&'static str> {
-    metal_registry().iter().map(|op| op.label()).collect()
+/// Luminal's Metal kernels. `lean` leaves out the two that apply a view — a broadcast, a
+/// transpose — by copying the operand. The planner picks between those and kernels that read
+/// through the view, per site, by timing a couple of hundred whole-graph candidates, which
+/// is far too few to find the good choice at every site: plans ended up copying every weight
+/// matrix on every call (once per row of a chunk). Without them a layer of Qwen3-0.6B takes
+/// about 1 ms for a chunk of eight instead of 3 to 7 ms, and far less scratch memory.
+fn registry(lean: bool) -> Vec<luminal_metal::RegisteredOp> {
+    const COPIES: [&str; 2] = ["CopyGeneric", "IndexMapApplyMaterialize"];
+    luminal_metal::metal_registry_filtered(|op| !(lean && COPIES.contains(&op.label())))
 }
 
 pub type BucketPlan =
@@ -94,9 +89,25 @@ impl MetalBackend {
             for (id, value) in graph.profile_inputs(q, c)? {
                 data.insert(id, host(value));
             }
-            let mut runtime = MetalRuntime::load_with(&graph.graph, bindings(graph), registry())?
-                .with_device(&device)?;
-            let outcome = runtime.search(spec.bounds(), spec.profile_dims(), &data, options)?;
+            // First without the kernels that copy an operand to apply a view; a graph that
+            // has no plan without them gets the full set.
+            let mut searched = None;
+            for lean in [true, false] {
+                let mut runtime =
+                    MetalRuntime::load_with(&graph.graph, bindings(graph), registry(lean))?
+                        .with_device(&device)?;
+                match runtime.search(spec.bounds(), spec.profile_dims(), &data, options) {
+                    Ok(outcome) => {
+                        searched = Some((runtime, outcome));
+                        break;
+                    }
+                    Err(e) if lean => {
+                        tracing::warn!("no plan without copy kernels, using them: {e:#}")
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let (runtime, outcome) = searched.expect("the last attempt returns");
             let scratch_bytes = runtime.arena_bytes()?;
             let resource_bindings = resources
                 .iter()

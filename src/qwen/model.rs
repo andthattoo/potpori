@@ -172,7 +172,26 @@ pub(super) fn weight(
 /// every row of the chunk walk the whole matrix again: on Metal the output head of a
 /// chunk of eight took six times as long.
 pub(super) fn linear(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    w.matmul(x.t()).t()
+    linear_columns(x, w).t()
+}
+
+/// [`linear`] without the final turn: `[out, rows]`. A graph's output has to be a buffer of
+/// its own, and turning it there would cost a copy kernel, so graphs that end in a linear
+/// layer (the output head) return this and the host turns it with [`rows_from_columns`].
+pub(super) fn linear_columns(x: GraphTensor, w: GraphTensor) -> GraphTensor {
+    w.matmul(x.t())
+}
+
+/// A `[columns, rows]` row-major matrix as `[rows, columns]`.
+pub fn rows_from_columns(data: &[f32], rows: usize) -> Vec<f32> {
+    let columns = data.len() / rows;
+    let mut out = vec![0f32; data.len()];
+    for (c, column) in data.chunks_exact(rows).enumerate() {
+        for (r, &value) in column.iter().enumerate() {
+            out[r * columns + c] = value;
+        }
+    }
+    out
 }
 
 impl QwenGraph {
@@ -292,7 +311,8 @@ impl QwenGraph {
                 "model.norm.weight".into(),
                 vec![cfg.hidden],
             );
-            x = linear(
+            // Logits leave the graph as `[vocab, q]`; the shard turns them.
+            x = linear_columns(
                 luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps),
                 embedding.unwrap(),
             );

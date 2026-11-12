@@ -59,9 +59,16 @@ impl<R: QwenRuntime + 'static> Shard<R> {
             .graph
             .step_inputs(data, s, start_pos as usize)
             .expect("invalid shard input");
-        self.runtime
+        let output = self
+            .runtime
             .step(inputs, s, start_pos as usize + s)
-            .expect("execute shard")
+            .expect("execute shard");
+        if self.range.1 == self.cfg.layers {
+            // The output head returns `[vocab, s]` (see `model::linear_columns`).
+            super::model::rows_from_columns(&output, s)
+        } else {
+            output
+        }
     }
 }
 

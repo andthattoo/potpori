@@ -116,42 +116,6 @@ fn time(shard: &mut Shard<MetalRuntime>, rows: usize, context: usize) -> [f64; 4
     ]
 }
 
-/// What happens when the planner may not copy operands: for each kernel kind that
-/// materializes a view, the same shards without it. A plan may not exist.
-#[test]
-#[ignore = "needs Metal and downloads Qwen3-0.6B"]
-fn metal_without_copies() {
-    println!("kernel kinds: {:?}", super::runtime::metal_kernel_kinds());
-    let l = CFG.layers;
-    for without in ["CopyGeneric", "CopyGeneric,IndexMapApplyMaterialize"] {
-        std::env::set_var("POTPORI_METAL_WITHOUT", without);
-        for (name, range) in [
-            ("4 layers", (1, 5)),
-            ("last layer + output head", (l - 1, l)),
-        ] {
-            let loaded = std::panic::catch_unwind(|| load(range, 512));
-            let Ok(mut shard) = loaded else {
-                println!("without [{without}] {name}: no plan");
-                continue;
-            };
-            for (rows, context) in [(1, 16), (CHUNK, 16), (CHUNK, 500)] {
-                let [total, _, kernels, _] = time(&mut shard, rows, context);
-                println!(
-                    "without [{without}] {name:26} rows {rows} context {context:3}: {total:7.2} \
-                     ms ({kernels:7.2} in kernels)"
-                );
-            }
-            let plan = shard.describe().unwrap_or_default();
-            for line in plan
-                .lines()
-                .filter(|l| !l.contains("buffer") && !l.contains("0.00 MiB"))
-            {
-                println!("    {line}");
-            }
-        }
-    }
-}
-
 /// The same profile with 16-bit weight storage: half the memory, plus a cast per call.
 #[test]
 #[ignore = "needs Metal and downloads Qwen3-0.6B"]

@@ -54,9 +54,6 @@ mod cuda_memory;
 mod metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_memory;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-#[allow(unused_imports)] // used by the Metal profiling tests
-pub use metal::kernel_kinds as metal_kernel_kinds;
 #[cfg(feature = "reference")]
 mod reference;
 #[cfg(feature = "reference")]

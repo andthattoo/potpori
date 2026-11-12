@@ -21,7 +21,10 @@ use luminal::prelude::*;
 use luminal_nn::{AttentionGeometry, KvCache};
 use serde::Deserialize;
 
-use super::model::{linear, weight, Inputs, QwenConfig, QwenGraph, StateBinding, TensorData};
+use super::model::{
+    linear, linear_columns, rows_from_columns, weight, Inputs, QwenConfig, QwenGraph, StateBinding,
+    TensorData,
+};
 use super::target::QwenRuntime;
 use crate::engine::TokenId;
 use crate::specfeat::FeatureDraft;
@@ -257,7 +260,8 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
     }
     let norm = w("norm.weight".into(), vec![m.hidden]);
     let block = luminal_nn::gather_rows(x, block_rows);
-    let logits = linear(
+    // `[vocab, block]`; the host turns it.
+    let logits = linear_columns(
         luminal_nn::rms_norm(block, Some(norm), None, m.rms_norm_eps),
         head,
     );
@@ -534,7 +538,7 @@ impl<R: QwenRuntime> DsparkDraft<R> {
             },
         )?;
         let t0 = Instant::now();
-        let logits = self.runtime.step(inputs, rows, visible)?;
+        let logits = rows_from_columns(&self.runtime.step(inputs, rows, visible)?, self.cfg.block);
         self.stats.graph += t0.elapsed();
         self.stats.graph_calls += 1;
         Ok(logits)
