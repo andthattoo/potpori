@@ -21,21 +21,6 @@ pub struct Shard<R: QwenRuntime> {
     range: (usize, usize),
 }
 impl<R: QwenRuntime + 'static> Shard<R> {
-    /// Load with generic kernels (any chunk size) — the Metal tests' baseline configuration.
-    #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
-        runtime: R,
-        cfg: QwenConfig,
-        range: (usize, usize),
-        first: bool,
-        last: bool,
-        path: &str,
-        capacity: usize,
-        search: usize,
-    ) -> Self {
-        Self::load_chunked(runtime, cfg, range, first, last, path, capacity, search, 0)
-    }
     /// Build the graph for layers `range`, load its weights from the prepared file at `path`
     /// and compile it. `first` embeds tokens; `last` emits logits. `chunk > 0` compiles
     /// kernels for exactly 1 and `chunk` tokens (the verification chunk, gamma + 1).
@@ -139,8 +124,12 @@ mod tests {
     struct TwoShards(Shard<MetalRuntime>, Shard<MetalRuntime>);
     impl TargetChain for TwoShards {
         fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
-            let (first, rest) = prompt.split_first().expect("non-empty prompt");
-            *self.verify(0, *first, rest).last().unwrap()
+            // One token at a time: the kernels are specialized to 1 or `chunk` tokens.
+            let mut last = 0;
+            for (pos, &token) in prompt.iter().enumerate() {
+                last = self.verify(pos as u32, token, &[])[0];
+            }
+            last
         }
         fn verify(&mut self, pos: u32, cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
             let chunk: Vec<_> = std::iter::once(cur).chain(drafts.iter().copied()).collect();
@@ -169,10 +158,10 @@ mod tests {
         let k = cfg.layers / 2;
         let rt = || MetalRuntime::default();
 
-        let mut full = QwenTarget::load(rt(), cfg, wp, 512, 200);
+        let mut full = QwenTarget::load_chunked(rt(), cfg, wp, 512, 200, 8);
         let mut cut = TwoShards(
-            Shard::load(rt(), cfg, (0, k), true, false, wp, 512, 200),
-            Shard::load(rt(), cfg, (k, cfg.layers), false, true, wp, 512, 200),
+            Shard::load_chunked(rt(), cfg, (0, k), true, false, wp, 512, 200, 8),
+            Shard::load_chunked(rt(), cfg, (k, cfg.layers), false, true, wp, 512, 200, 8),
         );
 
         let prompt: Vec<TokenId> = vec![40, 1079, 264, 4108, 4108];

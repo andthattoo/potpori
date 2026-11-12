@@ -51,13 +51,17 @@ fn load_shard(layers: (usize, usize), chunk: usize, max_seq: usize) -> Shard<Met
     )
 }
 
-fn load_full(max_seq: usize) -> QwenTarget<MetalRuntime> {
-    QwenTarget::load(
+/// The whole model in one process, with the same chunk-specialized kernels as the chain.
+/// (Generic kernels for any chunk size need a Metal arena sized for a full-cache chunk —
+/// hundreds of GiB at this capacity — and are not what `chat` and `serve` run.)
+fn load_full(chunk: usize, max_seq: usize) -> QwenTarget<MetalRuntime> {
+    QwenTarget::load_chunked(
         MetalRuntime::default(),
         CFG,
         &weights(),
         max_seq,
         SEARCH_GRAPHS,
+        chunk,
     )
 }
 
@@ -181,12 +185,12 @@ impl DraftEngine for PerfectDraft {
 #[ignore = "needs Metal and downloads Qwen3-0.6B"]
 fn qwen_chain_equals_single_process() {
     let l = CFG.layers;
-    let base = greedy(&mut load_full(512), &PROMPT, 24);
+    let base = greedy(&mut load_full(8, 512), &PROMPT, 24);
     for plan in [
         vec![(0, l / 2), (l / 2, l)],
         vec![(0, l / 3), (l / 3, 2 * l / 3), (2 * l / 3, l)],
     ] {
-        let (mut link, handles) = chain(&plan, 0, 512);
+        let (mut link, handles) = chain(&plan, 8, 512);
         let out = greedy(&mut Blocking(&mut link), &PROMPT, 24);
         finish(link, handles);
         println!(
@@ -203,8 +207,8 @@ fn qwen_chain_equals_single_process() {
 #[ignore = "needs Metal and downloads Qwen3-0.6B"]
 fn qwen_pipelined_chain_equals_greedy() {
     let k = CFG.layers / 2;
-    let base = greedy(&mut load_full(512), &PROMPT, 24);
-    let (mut link, handles) = chain(&[(0, k), (k, CFG.layers)], 0, 512);
+    let base = greedy(&mut load_full(5, 512), &PROMPT, 24);
+    let (mut link, handles) = chain(&[(0, k), (k, CFG.layers)], 5, 512); // chunk = gamma + 1
     let cfg = SpecConfig {
         gamma: 4,
         max_new: 24,

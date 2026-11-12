@@ -60,9 +60,27 @@ impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
         self.shard.capacity()
     }
     fn prefill(&mut self, prompt: &[TokenId]) -> TokenId {
-        let logits = self.shard.forward_tokens(0, prompt);
+        // Chunk-specialized kernels take 1 or `chunk` tokens; generic ones the whole prompt.
+        let chunk = match self.shard.chunk_size() {
+            0 => prompt.len(),
+            chunk => chunk,
+        };
         let v = self.shard.vocab_size();
-        argmax(&logits[logits.len() - v..])
+        let mut pos = 0;
+        let mut last = 0;
+        while pos < prompt.len() {
+            let take = if prompt.len() - pos >= chunk {
+                chunk
+            } else {
+                1
+            };
+            let logits = self
+                .shard
+                .forward_tokens(pos as u32, &prompt[pos..pos + take]);
+            last = argmax(&logits[logits.len() - v..]);
+            pos += take;
+        }
+        last
     }
     fn verify(&mut self, pos: u32, cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
         let chunk: Vec<_> = std::iter::once(cur).chain(drafts.iter().copied()).collect();
