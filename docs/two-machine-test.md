@@ -25,8 +25,7 @@ cargo test --locked --release --features cuda native_cuda_tiny_shards_and_rollba
 cargo test --locked --release --features metal qwen_chain_equals_single_process -- --ignored --nocapture
 ```
 
-The Metal backend has not been executed since the Luminal migration, so the Mac check is the
-one most likely to turn something up. Do it first.
+Both take several minutes: every shard searches its kernels at load.
 
 ## 1. Network
 

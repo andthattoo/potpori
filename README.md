@@ -45,8 +45,10 @@ visible to the dynamic loader; 12.9 is what has been tested. `CUDA_PATH` / `CUDA
 identify the toolkit, and `LUMINAL_CUDA_HEADERS_DIR` can point straight at its include
 directory. Without `nvcc`, set `CUDARC_CUDA_VERSION` (for example `12090` for 12.9).
 
-Both backends compute in F32. CUDA keeps the checkpoint's BF16 on the device; Metal has no BF16
-buffers, so weights are converted to F16 at load.
+Both backends compute in F32. CUDA keeps the checkpoint's BF16 on the device. Metal has no
+BF16 buffers and stores F32 there, which doubles the memory (the head half of Qwen3-4B is
+about 9 GB); `POTPORI_WEIGHT_DTYPE=f16` stores F16 instead, but the planner then keeps an F32
+copy as scratch, so it saves little.
 
 ## Establish peer trust
 
@@ -155,8 +157,8 @@ cargo test --locked --release --features metal dspark_on_real_weights -- --ignor
 
 The other Metal tests (`qwen_cut_2shard`, `qwen_pipelined_chain_equals_greedy`,
 `qwen_pipeline_throughput`, and the single-model tests in `src/qwen/target.rs`) run the same
-way. Metal execution has not been validated since the Luminal migration; see
-[the migration notes](docs/luminal-migration.md).
+way, but still load kernels for any chunk size, which need more Metal memory than exists at
+their cache sizes; they predate the Luminal migration and have not been run since.
 
 ## Layout
 

@@ -65,6 +65,12 @@ macOS Metal compilation and Linux CUDA compilation; those CI jobs have not run y
 - The chain roles live in `src/node.rs`, generic over a shard, and are tested over real QUIC
   with a synthetic shard. Network failures on the head are errors, not panics.
 - Weight preparation streams from the memory-mapped downloads; peak memory is one tensor.
-- The Metal chain tests were consolidated onto this protocol. They compile in CI but, like
-  the rest of the Metal backend, have not been executed since the migration.
+- The Metal chain tests were consolidated onto this protocol.
+- Metal was executed for the first time since the migration (2026-11-12, Qwen3-0.6B chains
+  and Qwen3-4B). Getting there changed four things: weights are stored F32 on Metal (it has
+  no BF16 buffers, and a 16-bit store costs a cast of every matrix per call); linear layers
+  are written `(W · xᵀ)ᵀ` so that a chunk's rows share each weight row; the Metal planner
+  no longer gets the two kernels that copy an operand to apply a view; and a step's inputs
+  are uploaded in one command buffer. A chunk of eight through Qwen3-0.6B's output head went
+  from 69 ms to 7 ms, and through eight layers of Qwen3-4B from 258 ms to 45 ms.
 

@@ -1,8 +1,9 @@
 # DSpark drafters for Qwen3, and what they mean for potpori
 
-Status: implemented, and checked on the CPU against the reference implementations with tiny
-models. It has not run on a GPU or with the published checkpoint yet — see
-[Running it](#4-running-it) for the one-machine check that does that.
+Status: implemented. Checked on the CPU against the reference implementations with tiny
+models, and run on Metal with Qwen3-4B and the published checkpoint: 4.69 tokens per trip
+over three prompts (see [What has been checked](#what-has-been-checked-and-what-has-not)).
+Not yet run on CUDA or across two machines.
 
 Sources: the DSpark paper (arXiv 2607.05147), the reference code
 ([deepseek-ai/DeepSpec](https://github.com/deepseek-ai/DeepSpec), MIT, read at commit
@@ -191,8 +192,9 @@ is one pass of five 4B-sized layers over seven rows, plus seven small matrix pro
   the seven argmaxes run on the CPU. The checkpoint is used as published; the confidence head
   is not used yet.
 
-Memory on the head for Qwen3-4B: about 2 GB for the drafter (its layers, plus its own copy
-of the embedding table) and 310 MB of RAM for the Markov head.
+Memory on the head for Qwen3-4B: about 2 GB for the drafter with 16-bit weights (its
+layers, plus its own copy of the embedding table), twice that on Metal, which stores 32-bit
+weights; and 310 MB of RAM for the Markov head.
 
 ## 4. Running it
 
@@ -241,12 +243,24 @@ Checked, on the CPU with tiny random models (`cargo test --features reference`, 
 - the protocol, over QUIC with synthetic shards: features reach the head in layer order
   through two- and three-node chains, and mismatched taps are refused at connect.
 
-Not checked: anything on a GPU. The CUDA and Metal adapters compile the drafter graph like
-any shard, but the graph has operations in a new combination (attention without a bias, a
-row gather before the output head), and kernel search for it has never run. The published
-checkpoint has not been loaded: the tests use a checkpoint written by DeepSpec's own model
-class at tiny size, so the tensor names and layout match, but the 2.8 GB file is untested.
-`dspark_on_real_weights` covers both.
+Measured, on Metal (M-series Mac, 32 GB) with Qwen3-4B and `dspark_qwen3_4b_block7`
+(`dspark_on_real_weights`, greedy, 96 new tokens per prompt):
+
+| Prompt | Tokens per trip |
+|---|---|
+| "Explain speculative decoding in one paragraph." | 3.21 |
+| "Write a Python function that checks whether a string is a palindrome." | 6.86 |
+| "A train leaves at 9:40 and arrives at 13:05. How long is the trip? Show the steps." | 5.35 |
+| all three | 4.69 |
+
+Acceptance by draft position 1 to 7: 0.93, 0.73, 0.56, 0.46, 0.42, 0.32, 0.27. The paper
+reports a mean of 4.73 for this drafter (at temperature 1) and 0.93 at the first position on
+math, so the port reads the target the way the reference does. The drafter took 67 ms per
+block in its graph and 11 ms in the Markov head; a chunk of eight took about 110 ms in the
+head's three shards and 120 ms in the tail's.
+
+Not checked: CUDA (the drafter graph has never been through its kernel search), and a live
+chain with the drafter between two machines.
 
 ### Which is better
 
