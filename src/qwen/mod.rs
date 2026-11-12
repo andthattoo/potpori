@@ -29,6 +29,8 @@ mod cuda_check;
     any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))
 ))]
 mod dspark_check;
+#[cfg(all(test, feature = "metal", target_vendor = "apple"))]
+mod metal_profile;
 #[cfg(all(test, any(feature = "cuda", feature = "reference")))]
 mod tiny;
 

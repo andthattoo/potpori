@@ -65,6 +65,19 @@ impl<R: QwenRuntime + 'static> Shard<R> {
     }
 }
 
+impl<R: QwenRuntime> Shard<R> {
+    /// Where this shard's device time went, if its backend measures it.
+    #[allow(dead_code)] // called by the Metal profiling test
+    pub fn profile(&self) -> Option<super::runtime::StepProfile> {
+        self.runtime.profile()
+    }
+    /// A summary of the compiled programs, if the backend provides one.
+    #[allow(dead_code)] // called by the Metal profiling test
+    pub fn describe(&self) -> Option<String> {
+        self.runtime.describe()
+    }
+}
+
 impl<R: QwenRuntime + 'static> ShardEngine for Shard<R> {
     fn hello(&self, next_layer: usize) -> SessionHello {
         SessionHello {

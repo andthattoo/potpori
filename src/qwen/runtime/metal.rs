@@ -56,6 +56,7 @@ pub struct MetalBackend {
     state: Vec<StateBinding>,
     logits: NodeIndex,
     memory: SharedArenaPlan,
+    profile: super::StepProfile,
     // Programs drop before the memory their executable addresses refer to.
     arena: super::metal_memory::Allocation,
 }
@@ -138,6 +139,7 @@ impl MetalBackend {
             state: graph.state.clone(),
             logits: graph.logits,
             memory,
+            profile: Default::default(),
             arena,
         })
     }
@@ -153,17 +155,102 @@ impl MetalBackend {
         let (runtime, external) = self.programs.select_mut(&dims)?;
         runtime.set_dim('q', query);
         runtime.set_dim('c', context);
+        let t0 = std::time::Instant::now();
         for (id, value) in inputs {
             let data = host(value);
             let range = runtime.input_arena_range(id)?;
             ensure!(range.bytes == data.bytes.len(), "step input size mismatch");
             self.arena.write(range.offset, &data.bytes)?;
         }
+        let t1 = std::time::Instant::now();
+        let launched = |runtime: &MetalRuntime| runtime.graph_stats().map_or(0, |s| s.launches);
+        let before = launched(runtime);
         runtime.execute_external(self.arena.buffer(), external)?;
+        let t2 = std::time::Instant::now();
+        self.profile.launches += launched(runtime).saturating_sub(before);
         let range = runtime.output_arena_range(self.logits)?;
         let binding = runtime.output_layout(self.logits)?;
         let data = HostBuffer::new(PlanDtype::F32, self.arena.read(range.offset, range.bytes)?)?;
-        luminal_metal::layouts::dense_f32(&data.as_f32()?, &binding.layout)
+        let output = luminal_metal::layouts::dense_f32(&data.as_f32()?, &binding.layout);
+        self.profile.steps += 1;
+        self.profile.upload += t1 - t0;
+        self.profile.execute += t2 - t1;
+        self.profile.readback += t2.elapsed();
+        output
+    }
+
+    pub fn profile(&self) -> Option<super::StepProfile> {
+        Some(self.profile)
+    }
+
+    /// Per bucket: how many kernels of each kind the chosen plan launches and how many bytes
+    /// they write at the profiled shape, the whole-buffer copies, and the largest buffers.
+    pub fn describe(&self) -> Option<String> {
+        use luminal::bufferize::BufferNode;
+        use std::fmt::Write as _;
+        let mib = |bytes: usize| bytes as f64 / (1 << 20) as f64;
+        let mut out = String::new();
+        for report in &self.reports {
+            let dims = &report.representative;
+            let size = |id: &luminal::bufferize::BufferId| {
+                report
+                    .plan
+                    .buffers
+                    .get(id)
+                    .and_then(|b| luminal_metal::symbolic::bytes(&b.layout, dims).ok())
+                    .unwrap_or(0)
+            };
+            let mut kinds: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+            let mut copies = (0usize, 0usize);
+            for node in report.plan.dag.node_weights() {
+                match node {
+                    BufferNode::Compute { op, writes, .. } => {
+                        let entry = kinds.entry(op.label().to_string()).or_default();
+                        entry.0 += 1;
+                        entry.1 += writes.iter().map(size).sum::<usize>();
+                    }
+                    BufferNode::BufferCopy { src, .. }
+                    | BufferNode::BufferCopyValue { src, .. } => {
+                        copies.0 += 1;
+                        copies.1 += size(src);
+                    }
+                    _ => {}
+                }
+            }
+            let kernels: usize = kinds.values().map(|k| k.0).sum();
+            let written: usize = kinds.values().map(|k| k.1).sum();
+            let _ = writeln!(
+                out,
+                "bucket {:?} profiled at {:?}: {kernels} compute nodes writing {:.1} MiB, {} \
+                 copies of {:.1} MiB, scratch {:.1} MiB",
+                report.ranges,
+                dims,
+                mib(written),
+                copies.0,
+                mib(copies.1),
+                mib(report.slab_bytes),
+            );
+            let mut kinds: Vec<_> = kinds.into_iter().collect();
+            kinds.sort_by_key(|(_, (count, bytes))| std::cmp::Reverse((*bytes, *count)));
+            for (label, (count, bytes)) in kinds.iter().take(30) {
+                let _ = writeln!(
+                    out,
+                    "  {count:5} x {label:<40} writes {:9.2} MiB",
+                    mib(*bytes)
+                );
+            }
+            let mut buffers: Vec<_> = report
+                .plan
+                .buffers
+                .values()
+                .map(|b| (size(&b.id), b.label.as_str()))
+                .collect();
+            buffers.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+            for (bytes, label) in buffers.iter().take(8) {
+                let _ = writeln!(out, "  buffer {:9.2} MiB  {label}", mib(*bytes));
+            }
+        }
+        Some(out)
     }
 
     pub fn reset(&mut self) -> Result<()> {

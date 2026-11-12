@@ -4,6 +4,22 @@
 //! outlive the compiled programs.
 use super::model::{Inputs, QwenGraph};
 use anyhow::Result;
+use std::time::Duration;
+
+/// Where a runtime's step time went, summed over `steps` calls (backends that measure it).
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // read by the Metal profiling test
+pub struct StepProfile {
+    pub steps: u64,
+    /// Writing the step's inputs to the device.
+    pub upload: Duration,
+    /// Running the kernels, start to finish.
+    pub execute: Duration,
+    /// Reading the output back.
+    pub readback: Duration,
+    /// Program executions (one command buffer each).
+    pub launches: u64,
+}
 
 pub trait QwenRuntime {
     /// Search and compile kernels for `graph`, and upload `weights`.
@@ -13,6 +29,17 @@ pub trait QwenRuntime {
     fn step(&mut self, inputs: Inputs, query: usize, context: usize) -> Result<Vec<f32>>;
     /// Clear the KV cache.
     fn reset(&mut self) -> Result<()>;
+    /// Time and launch counts since compilation, if this backend measures them.
+    #[allow(dead_code)] // called by the Metal profiling test
+    fn profile(&self) -> Option<StepProfile> {
+        None
+    }
+    /// A summary of the compiled programs — kernels by kind, copies, largest buffers — for
+    /// diagnosing where time goes.
+    #[allow(dead_code)] // called by the Metal profiling test
+    fn describe(&self) -> Option<String> {
+        None
+    }
 }
 
 // The adapters keep the per-bucket search reports of the Luminal examples they derive from;
@@ -61,6 +88,12 @@ macro_rules! adapter {
             }
             fn reset(&mut self) -> Result<()> {
                 self.backend.as_mut().expect("compile before reset").reset()
+            }
+            fn profile(&self) -> Option<StepProfile> {
+                self.backend.as_ref().and_then(|backend| backend.profile())
+            }
+            fn describe(&self) -> Option<String> {
+                self.backend.as_ref().and_then(|backend| backend.describe())
             }
         }
     };

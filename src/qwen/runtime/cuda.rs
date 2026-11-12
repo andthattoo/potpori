@@ -170,6 +170,14 @@ impl CudaBackend {
         luminal_cuda_lite::layouts::dense_f32(&data.as_f32()?, &binding.layout)
     }
 
+    pub fn profile(&self) -> Option<super::StepProfile> {
+        None
+    }
+
+    pub fn describe(&self) -> Option<String> {
+        None
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         for state in &self.state {
             let home = self.memory.homes[&ResourceId(state.input.index() as u64)];
