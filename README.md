@@ -45,7 +45,8 @@ visible to the dynamic loader; 12.9 is what has been tested. `CUDA_PATH` / `CUDA
 identify the toolkit, and `LUMINAL_CUDA_HEADERS_DIR` can point straight at its include
 directory. Without `nvcc`, set `CUDARC_CUDA_VERSION` (for example `12090` for 12.9).
 
-Both backends compute in F32, casting from BF16 checkpoint storage.
+Both backends compute in F32. CUDA keeps the checkpoint's BF16 on the device; Metal has no BF16
+buffers, so weights are converted to F16 at load.
 
 ## Establish peer trust
 

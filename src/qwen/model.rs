@@ -71,7 +71,6 @@ impl QwenConfig {
 pub enum TensorData {
     F32(Vec<f32>),
     BF16(Vec<u16>),
-    #[allow(dead_code)] // accepted by the adapters; no current graph uses it
     F16(Vec<u16>),
     I32(Vec<i32>),
 }
@@ -116,18 +115,36 @@ pub struct QwenGraph {
     pub(super) drafter: Option<super::dspark::DrafterPorts>,
 }
 
+/// How checkpoint matrices are stored on the device. Arithmetic is F32 either way. CUDA keeps
+/// the checkpoint's bf16; Metal has no bf16 buffers, so the weights are converted to f16 at
+/// load (same size; exact except for magnitudes below f16's normal range, about 6e-5).
+pub fn matrix_dtype() -> DType {
+    let metal = cfg!(all(
+        feature = "metal",
+        target_os = "macos",
+        not(feature = "cuda")
+    ));
+    // Tests can exercise the f16 path on any backend.
+    let forced = cfg!(test) && std::env::var("POTPORI_TEST_F16").is_ok();
+    if metal || forced {
+        DType::F16
+    } else {
+        DType::Bf16
+    }
+}
+
 pub(super) fn weight(
     cx: &mut Graph,
     params: &mut Vec<Parameter>,
     name: String,
     shape: Vec<usize>,
 ) -> GraphTensor {
-    // Preserve F32 arithmetic while explicitly declaring BF16 checkpoint storage.
+    // F32 arithmetic, with the matrix's narrower device storage declared explicitly.
     let port = cx.named_tensor(&name, shape.clone(), DType::F32);
     let dtype = if name.contains("norm") {
         DType::F32
     } else {
-        DType::Bf16
+        matrix_dtype()
     };
     let source = cx.input_source(port.id, dtype);
     params.push(Parameter {

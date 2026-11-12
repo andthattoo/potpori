@@ -255,6 +255,21 @@ pub fn load_inputs(
                     .map(|x| bf16::from_f32(x).to_bits())
                     .collect(),
             ),
+            DType::F16 if tensor.dtype() == Dtype::F16 => TensorData::F16(
+                tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect(),
+            ),
+            DType::F16 => TensorData::F16(
+                tensor_to_f32(&tensor)
+                    .into_iter()
+                    .map(|x| f16::from_f32(x).to_bits())
+                    .collect(),
+            ),
             DType::F32 => TensorData::F32(tensor_to_f32(&tensor)),
             _ => anyhow::bail!("unsupported parameter dtype"),
         };
