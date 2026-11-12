@@ -45,14 +45,17 @@ fn verify_ms(
 fn cuda_substrate_check() {
     let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("download/prepare Qwen3-0.6B");
     let weights = dir.join(super::hf::COMBINED_WEIGHTS_FILE);
-    // (1) Build + run: if we get past load(), Luminal CUDA + NVRTC works.
+    // (1) Build + run: if we get past load(), Luminal CUDA + NVRTC works. Kernels for 1 and
+    // 8 tokens, as chat and serve load them: generic kernels make Luminal size the arena for
+    // a chunk as long as the whole cache, far past any GPU.
     let rt = CudaRuntime::default();
-    let mut t = QwenTarget::load(
+    let mut t = QwenTarget::load_chunked(
         rt,
         QwenConfig::QWEN3_0_6B,
         weights.to_str().unwrap(),
         768,
         200,
+        8,
     );
     println!("\n[CUDA] Luminal CUDA loaded a 0.6B model (NVRTC ok).");
 
@@ -70,8 +73,8 @@ fn cuda_substrate_check() {
     }
     println!("[CUDA] greedy 0.6B: {out:?}");
 
-    // (3) Kernel cliff: build ~100 tokens of context, then time a single-token (s=1) vs an
-    // 8-token (s=8) forward to measure the current backend's bucket behavior.
+    // (3) Chunk cost: build ~100 tokens of context, then time a single-token (s=1) vs an
+    // 8-token (s=8) forward on the two specialized kernels.
     t.reset();
     let mut c = t.prefill(&[40]);
     let mut pos = 1u32;
@@ -83,10 +86,12 @@ fn cuda_substrate_check() {
     let drafts = vec![c; 7];
     let ms8 = verify_ms(&mut t, pos, c, &drafts, 5);
     let ratio = ms8 / ms1.max(1e-6);
-    println!("[CUDA] generic-bucket forward (ctx~{pos}): s=1 {ms1:.1} ms | s=8 {ms8:.1} ms | ratio {ratio:.1}×");
+    println!("[CUDA] chunk-specialized forward (ctx~{pos}): s=1 {ms1:.1} ms | s=8 {ms8:.1} ms | ratio {ratio:.1}×");
     if ratio > 3.0 {
-        println!("[CUDA] => the generic multi-token kernel is slow here; chunk-specialized kernels (--chunk) matter.");
+        println!("[CUDA] => an 8-token chunk costs much more than one token; verification gains little here.");
     } else {
-        println!("[CUDA] => the generic multi-token kernel scales normally here.");
+        println!(
+            "[CUDA] => an 8-token chunk costs at most 3× one token: verifying 7 drafts pays off."
+        );
     }
 }

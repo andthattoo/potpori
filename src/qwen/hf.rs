@@ -205,7 +205,9 @@ pub fn combine_safetensors_to_bf16(
     // truncated file under the final name.
     let temp = tempfile::NamedTempFile::new_in(model_dir)?;
     safetensors::serialize_to_file(tensors, None, temp.path())?;
-    File::open(temp.path())?.sync_all()?;
+    // Flush through the temp file's own read-write handle: Windows refuses to flush a
+    // handle opened read-only.
+    temp.as_file().sync_all()?;
     temp.persist(&output_path).map_err(|e| e.error)?;
     Ok(output_path)
 }
