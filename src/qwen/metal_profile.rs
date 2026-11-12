@@ -90,7 +90,7 @@ fn load(range: (usize, usize), capacity: usize) -> Shard<MetalRuntime> {
 /// `context` positions visible.
 fn time(shard: &mut Shard<MetalRuntime>, rows: usize, context: usize) -> [f64; 4] {
     let pos = (context - rows) as u32;
-    let mut call = |shard: &mut Shard<MetalRuntime>| {
+    let call = |shard: &mut Shard<MetalRuntime>| {
         if shard.range().0 == 0 {
             let tokens: Vec<TokenId> = (0..rows as TokenId).map(|i| 1000 + i).collect();
             shard.forward_tokens(pos, &tokens)
@@ -130,25 +130,29 @@ fn metal_profile() {
 
     println!("\n== 2. Shard calls (ms per call: total = upload + kernels + readback) ==");
     let l = CFG.layers;
-    let cases: [(&str, (usize, usize), usize); 5] = [
-        ("embedding + layer 0", (0, 1), 512),
-        ("1 layer", (1, 2), 512),
-        ("4 layers", (1, 5), 512),
-        ("1 layer, cache of 64", (1, 2), 64),
-        ("last layer + output head", (l - 1, l), 512),
+    let cases: [(&str, (usize, usize)); 3] = [
+        ("1 layer", (1, 2)),
+        ("4 layers", (1, 5)),
+        ("last layer + output head", (l - 1, l)),
     ];
     let mut plans = Vec::new();
-    for (name, range, capacity) in cases {
-        let mut shard = load(range, capacity);
-        let far = capacity - 12;
-        for (rows, context) in [(1, 16), (CHUNK, 16), (1, far), (CHUNK, far)] {
-            let [total, upload, kernels, readback] = time(&mut shard, rows, context);
-            println!(
-                "{name:26} rows {rows} context {context:3}: {total:7.2} = {upload:6.2} + \
-                 {kernels:7.2} + {readback:6.2}"
-            );
+    // The same shards with each way of writing a linear layer (see `model::LinearForm`).
+    for form in ["turned", "rows", "plain"] {
+        std::env::set_var("POTPORI_LINEAR", form);
+        for (name, range) in cases {
+            let mut shard = load(range, 512);
+            for (rows, context) in [(1, 16), (CHUNK, 16), (1, 500), (CHUNK, 500)] {
+                let [total, upload, kernels, readback] = time(&mut shard, rows, context);
+                println!(
+                    "{form:6} {name:26} rows {rows} context {context:3}: {total:7.2} = \
+                     {upload:6.2} + {kernels:7.2} + {readback:6.2}"
+                );
+            }
+            plans.push((
+                format!("{form}: {name}"),
+                shard.describe().unwrap_or_default(),
+            ));
         }
-        plans.push((name, shard.describe().unwrap_or_default()));
     }
 
     println!("\n== 3. Compiled plans ==");

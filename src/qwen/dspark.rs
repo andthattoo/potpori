@@ -22,7 +22,7 @@ use luminal_nn::{AttentionGeometry, KvCache};
 use serde::Deserialize;
 
 use super::model::{
-    linear_weight, weight, Inputs, QwenConfig, QwenGraph, StateBinding, TensorData,
+    linear, linear_weight, project, weight, Inputs, QwenConfig, QwenGraph, StateBinding, TensorData,
 };
 use super::target::QwenRuntime;
 use crate::engine::TokenId;
@@ -190,7 +190,7 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
         .collect();
 
     let mut parameters = Vec::new();
-    // Linear layers are held turned, `[in, out]`, so that applying one is a plain matmul.
+    // Linear layers go through `linear`, which decides how the matrix is held.
     let mut w = |name: String, shape: Vec<usize>, linear: bool| {
         if linear {
             linear_weight(&mut cx, &mut parameters, name, shape)
@@ -203,11 +203,7 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
         vec![m.vocab_size, m.hidden],
         false,
     );
-    let head = if tied {
-        embedding.t()
-    } else {
-        w("lm_head.weight".into(), vec![m.vocab_size, m.hidden], true)
-    };
+    let head = (!tied).then(|| w("lm_head.weight".into(), vec![m.vocab_size, m.hidden], true));
     let fc = w(
         "fc.weight".into(),
         vec![m.hidden, cfg.feature_width()],
@@ -216,7 +212,12 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
     let hidden_norm = w("hidden_norm.weight".into(), vec![m.hidden], false);
 
     // P: the target's view of each context row. It feeds every layer unchanged.
-    let p = luminal_nn::rms_norm(features.matmul(fc), Some(hidden_norm), None, m.rms_norm_eps);
+    let p = luminal_nn::rms_norm(
+        linear(features, fc),
+        Some(hidden_norm),
+        None,
+        m.rms_norm_eps,
+    );
     let pick = from_target.expand_dim(1, m.hidden);
     let geometry = AttentionGeometry::new(m.n_heads, m.n_kv_heads, m.head_dim);
     let mut x = luminal_nn::embedding(tokens, embedding);
@@ -251,9 +252,9 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
                 rotation,
             )
         };
-        let q = rotary(normed.matmul(wq), qn);
-        let k = rotary(source.matmul(wk), kn);
-        let cache = KvCache::new(k_cache, v_cache).write(positions, k, source.matmul(wv));
+        let q = rotary(linear(normed, wq), qn);
+        let k = rotary(linear(source, wk), kn);
+        let cache = KvCache::new(k_cache, v_cache).write(positions, k, linear(source, wv));
         let seen = cache.read(gather);
         // No bias: every row sees every gathered position, earlier or later.
         let weights = luminal_nn::grouped_query_scores(q, seen.keys, geometry).softmax(vec![3]);
@@ -266,13 +267,17 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
                 dtype: DType::F32,
             });
         }
-        x += attention.matmul(wo);
+        x += linear(attention, wo);
         let normed = luminal_nn::rms_norm(x, Some(ffn_norm), None, m.rms_norm_eps);
-        x += (normed.matmul(gate).silu() * normed.matmul(up)).matmul(down);
+        x += linear(linear(normed, gate).silu() * linear(normed, up), down);
     }
     let norm = w("norm.weight".into(), vec![m.hidden], false);
     let block = luminal_nn::gather_rows(x, block_rows);
-    let logits = luminal_nn::rms_norm(block, Some(norm), None, m.rms_norm_eps).matmul(head);
+    let normed = luminal_nn::rms_norm(block, Some(norm), None, m.rms_norm_eps);
+    let logits = match head {
+        Some(head) => linear(normed, head),
+        None => project(normed, embedding),
+    };
     Ok(QwenGraph {
         graph: cx,
         parameters,

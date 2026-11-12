@@ -183,8 +183,29 @@ pub(super) fn weight(
     parameter(cx, params, name, shape, false)
 }
 
-/// The matrix of a linear layer, stored `[out, in]` in the checkpoint (`shape`) and held
-/// `[in, out]` in the graph: apply it with `x.matmul(w)`.
+/// How a linear layer `y = x · Wᵀ` is written in the graph. The kernels Luminal generates
+/// run one thread per output element, so the form decides what each thread reads.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum LinearForm {
+    /// `W` turned at load to `[in, out]`; `x.matmul(W)`.
+    Turned,
+    /// `W` as in the checkpoint; `W.matmul(xᵀ)ᵀ`: a thread reads one contiguous row of `W`,
+    /// and the threads for a chunk's rows read the same one.
+    Rows,
+    /// `W` as in the checkpoint; `x.matmul(Wᵀ)`.
+    Plain,
+}
+
+pub(super) fn linear_form() -> LinearForm {
+    match std::env::var("POTPORI_LINEAR").as_deref() {
+        Ok("rows") => LinearForm::Rows,
+        Ok("plain") => LinearForm::Plain,
+        _ => LinearForm::Turned,
+    }
+}
+
+/// The matrix of a linear layer, `[out, in]` in the checkpoint (`shape`). Apply it with
+/// [`linear`].
 pub(super) fn linear_weight(
     cx: &mut Graph,
     params: &mut Vec<Parameter>,
@@ -192,7 +213,25 @@ pub(super) fn linear_weight(
     shape: Vec<usize>,
 ) -> GraphTensor {
     assert_eq!(shape.len(), 2, "a linear layer's weight is a matrix");
-    parameter(cx, params, name, shape, true)
+    parameter(cx, params, name, shape, linear_form() == LinearForm::Turned)
+}
+
+/// Apply a [`linear_weight`] to rows `x`.
+pub(super) fn linear(x: GraphTensor, w: GraphTensor) -> GraphTensor {
+    match linear_form() {
+        LinearForm::Turned => x.matmul(w),
+        LinearForm::Rows => w.matmul(x.t()).t(),
+        LinearForm::Plain => x.matmul(w.t()),
+    }
+}
+
+/// Logits of rows `x` against an embedding table in the checkpoint's `[vocab, hidden]`
+/// orientation (the tied output head).
+pub(super) fn project(x: GraphTensor, table: GraphTensor) -> GraphTensor {
+    match linear_form() {
+        LinearForm::Rows => table.matmul(x.t()).t(),
+        _ => x.matmul(table.t()),
+    }
 }
 
 impl QwenGraph {
@@ -241,10 +280,11 @@ impl QwenGraph {
             }
         };
         let embedding = first.then(|| table(&mut cx, &mut parameters, false));
+        // (the output head, and whether it is a `linear_weight` or a plain table)
         let head = match (last, embedding) {
             (false, _) => None,
-            (true, Some(embedding)) => Some(embedding.t()),
-            (true, None) => Some(table(&mut cx, &mut parameters, true)),
+            (true, Some(embedding)) => Some((embedding, false)),
+            (true, None) => Some((table(&mut cx, &mut parameters, true), true)),
         };
         let mut x = if first {
             luminal_nn::embedding(input, embedding.unwrap())
@@ -276,14 +316,14 @@ impl QwenGraph {
             let v_cache = cx.tensor(vec![capacity, cfg.kv_dim()], DType::F32);
             let normed = luminal_nn::rms_norm(x, Some(attn_norm), None, cfg.rms_norm_eps);
             let q = luminal_nn::rotary_apply(
-                luminal_nn::rms_norm_heads(normed.matmul(wq), cfg.head_dim, qn, cfg.rms_norm_eps),
+                luminal_nn::rms_norm_heads(linear(normed, wq), cfg.head_dim, qn, cfg.rms_norm_eps),
                 cfg.head_dim,
                 cos,
                 sin,
                 rotation,
             );
             let k = luminal_nn::rotary_apply(
-                luminal_nn::rms_norm_heads(normed.matmul(wk), cfg.head_dim, kn, cfg.rms_norm_eps),
+                luminal_nn::rms_norm_heads(linear(normed, wk), cfg.head_dim, kn, cfg.rms_norm_eps),
                 cfg.head_dim,
                 cos,
                 sin,
@@ -292,7 +332,7 @@ impl QwenGraph {
             let attention = luminal_nn::paged_attention(
                 q,
                 k,
-                normed.matmul(wv),
+                linear(normed, wv),
                 KvCache::new(k_cache, v_cache),
                 CacheAccess::new(positions, gather),
                 luminal_nn::causal_bias(positions, gather),
@@ -310,18 +350,23 @@ impl QwenGraph {
                 elements: capacity * cfg.kv_dim(),
                 dtype: DType::F32,
             });
-            x += attention.output.matmul(wo);
+            x += linear(attention.output, wo);
             let normed = luminal_nn::rms_norm(x, Some(ffn_norm), None, cfg.rms_norm_eps);
-            x += (normed.matmul(gate).silu() * normed.matmul(up)).matmul(down);
+            x += linear(linear(normed, gate).silu() * linear(normed, up), down);
         }
-        if let Some(head) = head {
+        if let Some((head, is_linear)) = head {
             let norm = weight(
                 &mut cx,
                 &mut parameters,
                 "model.norm.weight".into(),
                 vec![cfg.hidden],
             );
-            x = luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps).matmul(head);
+            let normed = luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps);
+            x = if is_linear {
+                linear(normed, head)
+            } else {
+                project(normed, head)
+            };
         }
         Ok(Self {
             graph: cx,
