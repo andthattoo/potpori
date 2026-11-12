@@ -21,7 +21,9 @@ use luminal::prelude::*;
 use luminal_nn::{AttentionGeometry, KvCache};
 use serde::Deserialize;
 
-use super::model::{weight, Inputs, QwenConfig, QwenGraph, StateBinding, TensorData};
+use super::model::{
+    linear_weight, weight, Inputs, QwenConfig, QwenGraph, StateBinding, TensorData,
+};
 use super::target::QwenRuntime;
 use crate::engine::TokenId;
 use crate::specfeat::FeatureDraft;
@@ -188,29 +190,42 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
         .collect();
 
     let mut parameters = Vec::new();
-    let mut w = |name: String, shape| weight(&mut cx, &mut parameters, name, shape);
-    let embedding = w("embed_tokens.weight".into(), vec![m.vocab_size, m.hidden]);
-    let head = if tied {
-        embedding
-    } else {
-        w("lm_head.weight".into(), vec![m.vocab_size, m.hidden])
+    // Linear layers are held turned, `[in, out]`, so that applying one is a plain matmul.
+    let mut w = |name: String, shape: Vec<usize>, linear: bool| {
+        if linear {
+            linear_weight(&mut cx, &mut parameters, name, shape)
+        } else {
+            weight(&mut cx, &mut parameters, name, shape)
+        }
     };
-    let fc = w("fc.weight".into(), vec![m.hidden, cfg.feature_width()]);
-    let hidden_norm = w("hidden_norm.weight".into(), vec![m.hidden]);
+    let embedding = w(
+        "embed_tokens.weight".into(),
+        vec![m.vocab_size, m.hidden],
+        false,
+    );
+    let head = if tied {
+        embedding.t()
+    } else {
+        w("lm_head.weight".into(), vec![m.vocab_size, m.hidden], true)
+    };
+    let fc = w(
+        "fc.weight".into(),
+        vec![m.hidden, cfg.feature_width()],
+        true,
+    );
+    let hidden_norm = w("hidden_norm.weight".into(), vec![m.hidden], false);
 
     // P: the target's view of each context row. It feeds every layer unchanged.
-    let p = luminal_nn::rms_norm(
-        features.matmul(fc.t()),
-        Some(hidden_norm),
-        None,
-        m.rms_norm_eps,
-    );
+    let p = luminal_nn::rms_norm(features.matmul(fc), Some(hidden_norm), None, m.rms_norm_eps);
     let pick = from_target.expand_dim(1, m.hidden);
     let geometry = AttentionGeometry::new(m.n_heads, m.n_kv_heads, m.head_dim);
     let mut x = luminal_nn::embedding(tokens, embedding);
     let mut state = Vec::new();
     for (l, &(k_cache, v_cache)) in caches.iter().enumerate() {
-        let mut w = |suffix: &str, shape| w(format!("layers.{l}.{suffix}.weight"), shape);
+        let mut w = |suffix: &str, shape: Vec<usize>| {
+            let linear = shape.len() == 2;
+            w(format!("layers.{l}.{suffix}.weight"), shape, linear)
+        };
         let attn_norm = w("input_layernorm", vec![m.hidden]);
         let wq = w("self_attn.q_proj", vec![m.q_dim(), m.hidden]);
         let wk = w("self_attn.k_proj", vec![m.kv_dim(), m.hidden]);
@@ -236,9 +251,9 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
                 rotation,
             )
         };
-        let q = rotary(normed.matmul(wq.t()), qn);
-        let k = rotary(source.matmul(wk.t()), kn);
-        let cache = KvCache::new(k_cache, v_cache).write(positions, k, source.matmul(wv.t()));
+        let q = rotary(normed.matmul(wq), qn);
+        let k = rotary(source.matmul(wk), kn);
+        let cache = KvCache::new(k_cache, v_cache).write(positions, k, source.matmul(wv));
         let seen = cache.read(gather);
         // No bias: every row sees every gathered position, earlier or later.
         let weights = luminal_nn::grouped_query_scores(q, seen.keys, geometry).softmax(vec![3]);
@@ -251,13 +266,13 @@ pub fn build_graph(cfg: &DsparkConfig, capacity: usize, tied: bool) -> Result<Qw
                 dtype: DType::F32,
             });
         }
-        x += attention.matmul(wo.t());
+        x += attention.matmul(wo);
         let normed = luminal_nn::rms_norm(x, Some(ffn_norm), None, m.rms_norm_eps);
-        x += (normed.matmul(gate.t()).silu() * normed.matmul(up.t())).matmul(down.t());
+        x += (normed.matmul(gate).silu() * normed.matmul(up)).matmul(down);
     }
-    let norm = w("norm.weight".into(), vec![m.hidden]);
+    let norm = w("norm.weight".into(), vec![m.hidden], false);
     let block = luminal_nn::gather_rows(x, block_rows);
-    let logits = luminal_nn::rms_norm(block, Some(norm), None, m.rms_norm_eps).matmul(head.t());
+    let logits = luminal_nn::rms_norm(block, Some(norm), None, m.rms_norm_eps).matmul(head);
     Ok(QwenGraph {
         graph: cx,
         parameters,

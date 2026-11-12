@@ -238,44 +238,66 @@ pub fn load_inputs(
     for p in &graph.parameters {
         let tensor = tensors.tensor(&p.name)?;
         anyhow::ensure!(tensor.shape() == p.shape, "shape mismatch for {}", p.name);
+        let bits = |tensor: &safetensors::tensor::TensorView| -> Vec<u16> {
+            tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect()
+        };
+        // Linear layers are held `[in, out]` in the graph; the checkpoint has `[out, in]`.
+        let (rows, cols) = match (p.transpose, &p.shape[..]) {
+            (true, &[rows, cols]) => (rows, cols),
+            (true, _) => anyhow::bail!("{} is not a matrix", p.name),
+            (false, _) => (0, 0),
+        };
         let data = match p.dtype {
-            DType::Bf16 if tensor.dtype() == Dtype::BF16 => TensorData::BF16(
-                tensor
-                    .data()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                    .collect(),
-            ),
             // A checkpoint used as published may store a matrix in another float type.
-            DType::Bf16 => TensorData::BF16(
+            DType::Bf16 if tensor.dtype() == Dtype::BF16 => {
+                TensorData::BF16(turned(bits(&tensor), rows, cols))
+            }
+            DType::Bf16 => TensorData::BF16(turned(
                 tensor_to_f32(&tensor)
                     .into_iter()
                     .map(|x| bf16::from_f32(x).to_bits())
                     .collect(),
-            ),
-            DType::F16 if tensor.dtype() == Dtype::F16 => TensorData::F16(
-                tensor
-                    .data()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                    .collect(),
-            ),
-            DType::F16 => TensorData::F16(
+                rows,
+                cols,
+            )),
+            DType::F16 if tensor.dtype() == Dtype::F16 => {
+                TensorData::F16(turned(bits(&tensor), rows, cols))
+            }
+            DType::F16 => TensorData::F16(turned(
                 tensor_to_f32(&tensor)
                     .into_iter()
                     .map(|x| f16::from_f32(x).to_bits())
                     .collect(),
-            ),
-            DType::F32 => TensorData::F32(tensor_to_f32(&tensor)),
+                rows,
+                cols,
+            )),
+            DType::F32 => TensorData::F32(turned(tensor_to_f32(&tensor), rows, cols)),
             _ => anyhow::bail!("unsupported parameter dtype"),
         };
         inputs.insert(p.input, data);
     }
     Ok(inputs)
+}
+
+/// A `[rows, cols]` row-major matrix transposed to `[cols, rows]`; `rows == 0` leaves the
+/// data as it is.
+fn turned<T: Copy + Default>(data: Vec<T>, rows: usize, cols: usize) -> Vec<T> {
+    if rows == 0 {
+        return data;
+    }
+    let mut out = vec![T::default(); data.len()];
+    for (r, row) in data.chunks_exact(cols).enumerate() {
+        for (c, &value) in row.iter().enumerate() {
+            out[c * rows + r] = value;
+        }
+    }
+    out
 }
 
 /// Read one tensor of a safetensors file as f32, checking its shape.

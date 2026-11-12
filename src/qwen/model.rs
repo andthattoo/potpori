@@ -84,8 +84,12 @@ pub type Inputs = FxHashMap<NodeIndex, TensorData>;
 pub struct Parameter {
     pub input: NodeIndex,
     pub name: String,
+    /// Shape in the checkpoint.
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// The graph holds this matrix transposed, `[in, out]`: it is turned at load, so that a
+    /// linear layer is a plain matmul and no kernel has to turn it on every call.
+    pub transpose: bool,
 }
 #[derive(Clone)]
 pub struct StateBinding {
@@ -115,32 +119,44 @@ pub struct QwenGraph {
     pub(super) drafter: Option<super::dspark::DrafterPorts>,
 }
 
-/// How checkpoint matrices are stored on the device. Arithmetic is F32 either way. CUDA keeps
-/// the checkpoint's bf16; Metal has no bf16 buffers, so the weights are converted to f16 at
-/// load (same size; exact except for magnitudes below f16's normal range, about 6e-5).
+/// How checkpoint matrices are stored on the device. Arithmetic is F32 either way; a
+/// narrower type halves the memory but costs a cast of every matrix on every call.
+///
+/// CUDA keeps the checkpoint's bf16. Metal has no bf16 buffers, and there the per-call cast
+/// dominates a shard's time, so Metal stores f32. `POTPORI_WEIGHT_DTYPE` = `f32`, `f16` or
+/// `bf16` overrides the choice (f16 is exact for bf16 weights except below about 6e-5).
 pub fn matrix_dtype() -> DType {
-    let metal = cfg!(all(
+    match std::env::var("POTPORI_WEIGHT_DTYPE").as_deref() {
+        Ok("f32") => return DType::F32,
+        Ok("f16") => return DType::F16,
+        Ok("bf16") => return DType::Bf16,
+        _ => {}
+    }
+    if cfg!(all(
         feature = "metal",
         target_os = "macos",
         not(feature = "cuda")
-    ));
-    // Tests can exercise the f16 path on any backend.
-    let forced = cfg!(test) && std::env::var("POTPORI_TEST_F16").is_ok();
-    if metal || forced {
-        DType::F16
+    )) {
+        DType::F32
     } else {
         DType::Bf16
     }
 }
 
-pub(super) fn weight(
+fn parameter(
     cx: &mut Graph,
     params: &mut Vec<Parameter>,
     name: String,
     shape: Vec<usize>,
+    transpose: bool,
 ) -> GraphTensor {
-    // F32 arithmetic, with the matrix's narrower device storage declared explicitly.
-    let port = cx.named_tensor(&name, shape.clone(), DType::F32);
+    let held = if transpose {
+        shape.iter().rev().copied().collect()
+    } else {
+        shape.clone()
+    };
+    // F32 arithmetic, with the matrix's device storage declared explicitly.
+    let port = cx.named_tensor(&name, held, DType::F32);
     let dtype = if name.contains("norm") {
         DType::F32
     } else {
@@ -152,8 +168,31 @@ pub(super) fn weight(
         name,
         shape,
         dtype,
+        transpose,
     });
     port
+}
+
+/// A checkpoint tensor in the checkpoint's own orientation: norm vectors, embedding tables.
+pub(super) fn weight(
+    cx: &mut Graph,
+    params: &mut Vec<Parameter>,
+    name: String,
+    shape: Vec<usize>,
+) -> GraphTensor {
+    parameter(cx, params, name, shape, false)
+}
+
+/// The matrix of a linear layer, stored `[out, in]` in the checkpoint (`shape`) and held
+/// `[in, out]` in the graph: apply it with `x.matmul(w)`.
+pub(super) fn linear_weight(
+    cx: &mut Graph,
+    params: &mut Vec<Parameter>,
+    name: String,
+    shape: Vec<usize>,
+) -> GraphTensor {
+    assert_eq!(shape.len(), 2, "a linear layer's weight is a matrix");
+    parameter(cx, params, name, shape, true)
 }
 
 impl QwenGraph {
@@ -189,14 +228,24 @@ impl QwenGraph {
         let sin = cx.tensor(vec![IntExpr::from('q'), cfg.head_dim.into()], DType::F32);
         let rotation = cx.tensor(vec![cfg.head_dim, cfg.head_dim], DType::F32);
         let mut parameters = Vec::new();
-        let embedding = (first || last).then(|| {
-            weight(
-                &mut cx,
-                &mut parameters,
-                "model.embed_tokens.weight".into(),
-                vec![cfg.vocab_size, cfg.hidden],
-            )
-        });
+        // The embedding table is also the output head. A shard that only needs the head
+        // holds the table turned, like any linear layer; the whole model in one shard needs
+        // both orientations and keeps the checkpoint's.
+        let table = |cx: &mut Graph, parameters: &mut Vec<Parameter>, turned: bool| {
+            let name = "model.embed_tokens.weight".to_string();
+            let shape = vec![cfg.vocab_size, cfg.hidden];
+            if turned {
+                linear_weight(cx, parameters, name, shape)
+            } else {
+                weight(cx, parameters, name, shape)
+            }
+        };
+        let embedding = first.then(|| table(&mut cx, &mut parameters, false));
+        let head = match (last, embedding) {
+            (false, _) => None,
+            (true, Some(embedding)) => Some(embedding.t()),
+            (true, None) => Some(table(&mut cx, &mut parameters, true)),
+        };
         let mut x = if first {
             luminal_nn::embedding(input, embedding.unwrap())
         } else {
@@ -204,13 +253,13 @@ impl QwenGraph {
         };
         let mut state = Vec::new();
         for l in range.0..range.1 {
-            let mut w = |suffix: &str, shape| {
-                weight(
-                    &mut cx,
-                    &mut parameters,
-                    format!("model.layers.{l}.{suffix}.weight"),
-                    shape,
-                )
+            let mut w = |suffix: &str, shape: Vec<usize>| {
+                let name = format!("model.layers.{l}.{suffix}.weight");
+                if shape.len() == 2 {
+                    linear_weight(&mut cx, &mut parameters, name, shape)
+                } else {
+                    weight(&mut cx, &mut parameters, name, shape)
+                }
             };
             let attn_norm = w("input_layernorm", vec![cfg.hidden]);
             let wq = w("self_attn.q_proj", vec![cfg.q_dim(), cfg.hidden]);
@@ -227,24 +276,14 @@ impl QwenGraph {
             let v_cache = cx.tensor(vec![capacity, cfg.kv_dim()], DType::F32);
             let normed = luminal_nn::rms_norm(x, Some(attn_norm), None, cfg.rms_norm_eps);
             let q = luminal_nn::rotary_apply(
-                luminal_nn::rms_norm_heads(
-                    normed.matmul(wq.t()),
-                    cfg.head_dim,
-                    qn,
-                    cfg.rms_norm_eps,
-                ),
+                luminal_nn::rms_norm_heads(normed.matmul(wq), cfg.head_dim, qn, cfg.rms_norm_eps),
                 cfg.head_dim,
                 cos,
                 sin,
                 rotation,
             );
             let k = luminal_nn::rotary_apply(
-                luminal_nn::rms_norm_heads(
-                    normed.matmul(wk.t()),
-                    cfg.head_dim,
-                    kn,
-                    cfg.rms_norm_eps,
-                ),
+                luminal_nn::rms_norm_heads(normed.matmul(wk), cfg.head_dim, kn, cfg.rms_norm_eps),
                 cfg.head_dim,
                 cos,
                 sin,
@@ -253,7 +292,7 @@ impl QwenGraph {
             let attention = luminal_nn::paged_attention(
                 q,
                 k,
-                normed.matmul(wv.t()),
+                normed.matmul(wv),
                 KvCache::new(k_cache, v_cache),
                 CacheAccess::new(positions, gather),
                 luminal_nn::causal_bias(positions, gather),
@@ -271,19 +310,18 @@ impl QwenGraph {
                 elements: capacity * cfg.kv_dim(),
                 dtype: DType::F32,
             });
-            x += attention.output.matmul(wo.t());
+            x += attention.output.matmul(wo);
             let normed = luminal_nn::rms_norm(x, Some(ffn_norm), None, cfg.rms_norm_eps);
-            x += (normed.matmul(gate.t()).silu() * normed.matmul(up.t())).matmul(down.t());
+            x += (normed.matmul(gate).silu() * normed.matmul(up)).matmul(down);
         }
-        if last {
+        if let Some(head) = head {
             let norm = weight(
                 &mut cx,
                 &mut parameters,
                 "model.norm.weight".into(),
                 vec![cfg.hidden],
             );
-            x = luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps)
-                .matmul(embedding.unwrap().t());
+            x = luminal_nn::rms_norm(x, Some(norm), None, cfg.rms_norm_eps).matmul(head);
         }
         Ok(Self {
             graph: cx,
