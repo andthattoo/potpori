@@ -32,6 +32,10 @@ metal = ["dep:luminal_metal", "dep:metal", "dep:objc", "engine"]
 # Luminal's CPU reference executor: slow, exact, no GPU. Tests only — it runs the real graphs
 # on tiny models, so graph changes can be checked anywhere.
 reference = ["dep:luminal_reference", "engine"]
+# Prototype: Qwen shards on candle instead of Luminal (CPU; `candle-cuda` for NVIDIA). Same
+# ShardEngine contract, so candle and Luminal nodes can share a chain. Tests only so far.
+candle = ["dep:candle-core", "dep:candle-nn", "engine"]
+candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -59,6 +63,8 @@ luminal_reference = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb
 luminal_nn = { git = "https://github.com/luminal-ai/luminal", rev = "1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1", optional = true }
 cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
 tempfile = { version = "3", optional = true }
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
 
 # Model weight loading + tokenizer, behind the `engine` feature.
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"], optional = true }

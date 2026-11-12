@@ -2,8 +2,8 @@
 //! real graph, the shard cut and the absolute-position rollback on any runtime, with no
 //! download.
 use super::model::QwenConfig;
-use super::target::QwenRuntime;
 use crate::engine::TokenId;
+use crate::node::ShardEngine;
 
 /// Small, independent scalar reference: no Luminal operations or runtime state.
 pub fn reference_logits(
@@ -133,9 +133,31 @@ pub fn reference_logits(
 
 /// Exercise compilation, explicit checkpoint casts, KV shared across chunk sizes, shard
 /// boundaries and absolute-position rollback on a tiny deterministic model.
-pub fn shards_and_rollback<R: QwenRuntime + Default + 'static>() {
-    use super::{model::QwenGraph, shard::Shard};
-    use crate::node::ShardEngine as _;
+#[cfg(any(feature = "cuda", feature = "reference"))]
+pub fn shards_and_rollback<R: super::target::QwenRuntime + Default + 'static>() {
+    check_shards_and_rollback(|cfg, range, path| {
+        super::shard::Shard::load_chunked(
+            R::default(),
+            cfg,
+            range,
+            range.0 == 0,
+            range.1 == cfg.layers,
+            path,
+            8,
+            8,
+            2,
+        )
+    });
+}
+
+/// The checks of [`shards_and_rollback`] for any shard backend: `load(cfg, layers, path)`
+/// loads layers `[a, b)` of the tiny model from the safetensors file at `path`, with room for
+/// 8 positions and chunks of 1 or 2 tokens. Whole model against the scalar reference, a
+/// two-shard cut against the whole model, and an overwritten speculation against a fresh cache.
+pub fn check_shards_and_rollback<S: ShardEngine>(
+    load: impl Fn(QwenConfig, (usize, usize), &str) -> S,
+) {
+    use super::model::QwenGraph;
     use safetensors::{tensor::TensorView, Dtype};
     let cfg = QwenConfig {
         layers: 2,
@@ -208,9 +230,9 @@ pub fn shards_and_rollback<R: QwenRuntime + Default + 'static>() {
     let path = dir.path().join("tiny.safetensors");
     std::fs::write(&path, safetensors::serialize(views, None).unwrap()).unwrap();
     let wp = path.to_str().unwrap();
-    let mut full = Shard::load_chunked(R::default(), cfg, (0, 2), true, true, wp, 8, 8, 2);
-    let mut head = Shard::load_chunked(R::default(), cfg, (0, 1), true, false, wp, 8, 8, 2);
-    let mut tail = Shard::load_chunked(R::default(), cfg, (1, 2), false, true, wp, 8, 8, 2);
+    let mut full = load(cfg, (0, 2), wp);
+    let mut head = load(cfg, (0, 1), wp);
+    let mut tail = load(cfg, (1, 2), wp);
     let mut rollback = None;
     let mut prefix = Vec::new();
     for (pos, tokens) in [(0, vec![1]), (1, vec![2, 3]), (1, vec![4, 5]), (3, vec![6])] {

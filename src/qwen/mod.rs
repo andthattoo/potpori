@@ -18,6 +18,8 @@ pub mod tok;
 
 // GPU integration tests (`--ignored`): CUDA on a tiny generated model and on real weights,
 // and the chain protocol over real Metal shards.
+#[cfg(all(test, feature = "candle"))]
+mod candle_check;
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
 mod chain_tests;
 #[cfg(all(test, feature = "reference"))]
@@ -31,8 +33,12 @@ mod cuda_check;
 mod dspark_check;
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]
 mod metal_profile;
-#[cfg(all(test, any(feature = "cuda", feature = "reference")))]
+#[cfg(all(test, any(feature = "cuda", feature = "reference", feature = "candle")))]
 mod tiny;
+// Prototype candle backend; only the tests call it so far.
+#[cfg(feature = "candle")]
+#[allow(dead_code)]
+pub mod candle_shard;
 
 use crate::engine::TokenId;
 use model::QwenConfig;

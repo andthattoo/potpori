@@ -18,7 +18,7 @@ pub struct QwenTarget<R: QwenRuntime> {
 
 impl<R: QwenRuntime + 'static> QwenTarget<R> {
     /// Load with generic kernels (any chunk size). Diagnostics and tests only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // called by the Metal tests in this file
     pub fn load(runtime: R, cfg: QwenConfig, path: &str, capacity: usize, search: usize) -> Self {
         Self::load_chunked(runtime, cfg, path, capacity, search, 0)
     }
@@ -97,7 +97,10 @@ impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
 
 /// Plain greedy decode through the verify primitive, one token per step: the reference the
 /// speculative drivers are compared against in the Metal tests.
-#[cfg(all(test, feature = "metal", target_vendor = "apple"))]
+#[cfg(all(
+    test,
+    any(all(feature = "metal", target_vendor = "apple"), feature = "candle")
+))]
 pub(crate) fn greedy<T: TargetChain>(
     t: &mut T,
     prompt: &[TokenId],
