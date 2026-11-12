@@ -81,10 +81,13 @@ fn dspark_loopback() {
     let chunk = dcfg.block + 1;
     let cut = CFG.layers / 2;
 
-    // The tail on its own thread, as `potpori serve --taps …` runs it.
+    // The tail on its own thread, as `potpori serve --taps …` runs it: load, then listen.
+    // The head loads only after the tail is up, so the two kernel searches do not share the
+    // GPU and skew each other's timings.
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let taps = dcfg.taps.clone();
     let tail = std::thread::spawn(move || {
+        let mut shard = load_node((cut, CFG.layers), &taps, chunk);
         let tls = TlsIdentity::for_tests();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -96,16 +99,16 @@ fn dspark_loopback() {
             listen_endpoint("127.0.0.1:0".parse().unwrap(), &tls).unwrap()
         };
         addr_tx.send(ep.local_addr().unwrap()).unwrap();
-        let mut shard = load_node((cut, CFG.layers), &taps, chunk);
         serve_tail(&mut shard, &ep, &rt).expect("tail serve");
     });
+    let tail_addr = addr_rx.recv().expect("the tail loads");
 
     let head = load_node((0, cut), &dcfg.taps, chunk);
     let mut drafter =
         DsparkDraft::load(Backend::default(), dcfg, &weights, MAX_SEQ, SEARCH_GRAPHS).unwrap();
     let mut chain = ChainLink::connect(
         head,
-        addr_rx.recv().unwrap(),
+        tail_addr,
         &TlsIdentity::for_tests(),
         &EOS_TOKENS,
         Duration::from_secs(1800),

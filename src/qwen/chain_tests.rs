@@ -7,6 +7,7 @@
 //! The same protocol is covered without a GPU, using a synthetic shard, in `crate::node`.
 
 use std::net::SocketAddr;
+use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -65,16 +66,19 @@ fn load_full(chunk: usize, max_seq: usize) -> QwenTarget<MetalRuntime> {
     )
 }
 
-/// Run a remote node (the tail if `downstream` is `None`) on its own thread for one session.
-/// The address is reported before the slow shard load, so the nodes load concurrently.
+/// A remote node on its own thread. Like `potpori serve`, it loads its shard first and only
+/// then listens: a node that accepted connections while still searching kernels would leave
+/// its upstream waiting past the handshake timeout. Its address arrives once it is ready.
 fn spawn_remote(
     layers: (usize, usize),
-    downstream: Option<SocketAddr>,
+    downstream: Option<Receiver<SocketAddr>>,
     chunk: usize,
     max_seq: usize,
-) -> (SocketAddr, JoinHandle<()>) {
+) -> (Receiver<SocketAddr>, JoinHandle<()>) {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
+        let mut shard = load_shard(layers, chunk, max_seq);
+        let downstream = downstream.map(|ready| ready.recv().expect("downstream addr"));
         let tls = TlsIdentity::for_tests();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -86,34 +90,28 @@ fn spawn_remote(
             listen_endpoint("127.0.0.1:0".parse().unwrap(), &tls).unwrap()
         };
         addr_tx.send(ep.local_addr().unwrap()).unwrap();
-        let mut shard = load_shard(layers, chunk, max_seq);
         match downstream {
             None => serve_tail(&mut shard, &ep, &rt).expect("tail serve"),
             Some(next) => serve_middle(&mut shard, &ep, next, &rt, &tls).expect("middle serve"),
         }
     });
-    (addr_rx.recv().expect("node addr"), handle)
+    (addr_rx, handle)
 }
 
-/// Bring up the remote nodes of `plan` (tail first) and connect the head to them.
+/// Load every node of `plan` (in parallel) and connect the head to the chain.
 fn chain(plan: &[(usize, usize)], chunk: usize, max_seq: usize) -> (Link, Vec<JoinHandle<()>>) {
     let mut handles = Vec::new();
-    let mut next: Option<SocketAddr> = None;
+    let mut next: Option<Receiver<SocketAddr>> = None;
     for &layers in plan[1..].iter().rev() {
-        let (addr, handle) = spawn_remote(layers, next, chunk, max_seq);
-        next = Some(addr);
+        let (ready, handle) = spawn_remote(layers, next.take(), chunk, max_seq);
+        next = Some(ready);
         handles.push(handle);
     }
     let head = load_shard(plan[0], chunk, max_seq);
+    let addr = next.unwrap().recv().expect("node addr");
     let wait = Duration::from_secs(900);
-    let link = ChainLink::connect(
-        head,
-        next.unwrap(),
-        &TlsIdentity::for_tests(),
-        &EOS_TOKENS,
-        wait,
-    )
-    .expect("connect chain");
+    let link = ChainLink::connect(head, addr, &TlsIdentity::for_tests(), &EOS_TOKENS, wait)
+        .expect("connect chain");
     (link, handles)
 }
 
