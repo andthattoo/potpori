@@ -15,7 +15,7 @@ use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
-use super::model::QwenConfig;
+use super::config::QwenConfig;
 use crate::engine::{TargetChain, TokenId};
 use crate::node::ShardEngine;
 use crate::transport::SessionHello;
@@ -55,14 +55,38 @@ pub struct CandleShard {
 
 /// The device a candle shard runs on: the GPU the build names (`candle-metal`, else
 /// `candle-cuda`), or the CPU for a plain `candle` build. A GPU build that cannot open its
-/// device panics rather than run on the CPU unnoticed.
+/// device panics rather than run on the CPU unnoticed. One device per process: every shard
+/// and the draft model share it.
 pub fn default_device() -> Device {
-    if cfg!(feature = "candle-metal") {
-        Device::new_metal(0).expect("open the Metal device")
-    } else if cfg!(feature = "candle-cuda") {
-        Device::new_cuda(0).expect("open the first CUDA device")
-    } else {
-        Device::Cpu
+    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            if cfg!(feature = "candle-metal") {
+                Device::new_metal(0).expect("open the Metal device")
+            } else if cfg!(feature = "candle-cuda") {
+                Device::new_cuda(0).expect("open the first CUDA device")
+            } else {
+                Device::Cpu
+            }
+        })
+        .clone()
+}
+
+/// What [`default_device`] is, for log lines.
+pub const DEVICE_NAME: &str = if cfg!(feature = "candle-metal") {
+    "candle-metal"
+} else if cfg!(feature = "candle-cuda") {
+    "candle-cuda"
+} else {
+    "candle-cpu"
+};
+
+/// Arithmetic and storage type of a shard: F32, as the Luminal shards compute, unless
+/// `POTPORI_CANDLE_DTYPE=bf16` (half the memory; logits can differ in the last bits).
+pub fn default_dtype() -> DType {
+    match std::env::var("POTPORI_CANDLE_DTYPE").as_deref() {
+        Ok("bf16") => DType::BF16,
+        _ => DType::F32,
     }
 }
 
@@ -322,13 +346,13 @@ impl TargetChain for CandleShard {
             "prefill needs the whole model"
         );
         let logits = self.forward_tokens(0, prompt);
-        super::target::argmax(&logits[logits.len() - self.cfg.vocab_size..])
+        super::argmax(&logits[logits.len() - self.cfg.vocab_size..])
     }
     fn verify(&mut self, pos: u32, cur: TokenId, drafts: &[TokenId]) -> Vec<TokenId> {
         let chunk: Vec<_> = std::iter::once(cur).chain(drafts.iter().copied()).collect();
         self.forward_tokens(pos, &chunk)
             .chunks_exact(self.cfg.vocab_size)
-            .map(super::target::argmax)
+            .map(super::argmax)
             .collect()
     }
     fn is_eos(&self, token: TokenId) -> bool {

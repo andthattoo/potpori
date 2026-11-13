@@ -11,26 +11,42 @@
 //!   - `potpori chat`     — the head: tokenizer, first shard and draft model, locally.
 //!
 //! Layout: [`chain`] is the config file, [`transport`] the wire, [`node`] the three roles,
-//! [`specpipe`] / [`specdecode`] the decoding drivers, and `qwen` the model on Luminal.
+//! [`specpipe`] / [`specdecode`] the decoding drivers, and `qwen` the model on Luminal or candle.
 
 // Without a GPU backend only `identity` runs, so most of the crate has no caller — don't warn.
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod chain;
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod engine;
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod node;
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod specdecode;
@@ -40,19 +56,31 @@ mod specdecode;
 )]
 mod specfeat;
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod specpipe;
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod transport;
 
-#[cfg(feature = "engine")]
+#[cfg(feature = "weights")]
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )),
     allow(dead_code)
 )]
 mod qwen;
@@ -77,7 +105,11 @@ struct TlsArgs {
 }
 
 impl TlsArgs {
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    ))]
     fn load(&self) -> Result<transport::TlsIdentity> {
         transport::TlsIdentity::load(&self.cert, &self.key, &self.trust)
     }
@@ -193,11 +225,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    ))]
     {
         run::dispatch(cli.cmd)
     }
-    #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
+    #[cfg(not(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos"),
+        feature = "candle"
+    )))]
     {
         let _ = cli.cmd;
         anyhow::bail!(
@@ -207,7 +247,11 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", target_os = "macos"),
+    feature = "candle"
+))]
 mod run {
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -219,38 +263,143 @@ mod run {
     use crate::node::{
         serve_middle, serve_tail, tap_ranges, ChainLink, ShardEngine as _, TappedShards,
     };
+    use crate::qwen::config::QwenConfig;
     use crate::qwen::draft::IncrementalDraft;
-    use crate::qwen::dspark::{DsparkConfig, DsparkDraft};
-    use crate::qwen::hf::{download_drafter, prepare_hf_model, COMBINED_WEIGHTS_FILE};
-    use crate::qwen::model::QwenConfig;
-    use crate::qwen::shard::Shard;
-    use crate::qwen::target::QwenTarget;
+    use crate::qwen::hf::{prepare_hf_model, COMBINED_WEIGHTS_FILE};
     use crate::qwen::tok::ChatTokenizer;
     use crate::qwen::{config_for, EOS_TOKENS};
     use crate::specdecode::{SpecConfig, SpecStats};
-    use crate::specfeat::run_feature_decode;
     use crate::specpipe::run_spec_decode_pipelined;
     use crate::transport::{listen_endpoint, TlsIdentity};
     use crate::{Cmd, Role};
 
-    // Backend selection: CUDA wins if both features are enabled.
-    #[cfg(feature = "cuda")]
-    type Backend = crate::qwen::runtime::CudaRuntime;
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    type Backend = crate::qwen::runtime::MetalRuntime;
+    /// The model backend: Luminal when one of its backends is enabled (CUDA wins over
+    /// Metal), else candle.
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    mod backend {
+        use anyhow::Result;
 
-    const BACKEND: &str = if cfg!(feature = "cuda") {
-        "cuda"
-    } else {
-        "metal"
-    };
+        use crate::engine::TargetChain;
+        use crate::qwen::config::QwenConfig;
+        use crate::qwen::shard::Shard;
+        use crate::qwen::target::QwenTarget;
+
+        #[cfg(feature = "cuda")]
+        pub type Runtime = crate::qwen::runtime::CudaRuntime;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        pub type Runtime = crate::qwen::runtime::MetalRuntime;
+
+        pub const NAME: &str = if cfg!(feature = "cuda") {
+            "cuda"
+        } else {
+            "metal"
+        };
+        /// What a load costs, for the log line.
+        pub const LOAD_NOTE: &str = " — kernel search, takes minutes";
+
+        pub type NodeShard = Shard<Runtime>;
+
+        pub fn load_shard(
+            cfg: QwenConfig,
+            range: (usize, usize),
+            weights: &str,
+            max_seq: usize,
+            search_graphs: usize,
+            chunk: usize,
+        ) -> Result<NodeShard> {
+            Ok(Shard::load_chunked(
+                Runtime::default(),
+                cfg,
+                range,
+                range.0 == 0,
+                range.1 == cfg.layers,
+                weights,
+                max_seq,
+                search_graphs,
+                chunk,
+            ))
+        }
+
+        /// The whole draft model, and the piece size its catch-up feeds must use: kernels
+        /// for {1, γ+1} tokens, as on the head and the remote shards.
+        pub fn load_draft(
+            cfg: QwenConfig,
+            weights: &str,
+            max_seq: usize,
+            search_graphs: usize,
+            chunk: usize,
+        ) -> Result<(impl TargetChain, usize)> {
+            let model = QwenTarget::load_chunked(
+                Runtime::default(),
+                cfg,
+                weights,
+                max_seq,
+                search_graphs,
+                chunk,
+            );
+            Ok((model, chunk))
+        }
+    }
+
+    #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
+    mod backend {
+        use anyhow::Result;
+
+        use crate::engine::TargetChain;
+        use crate::qwen::candle_shard::{default_device, default_dtype, CandleShard, DEVICE_NAME};
+        use crate::qwen::config::QwenConfig;
+
+        pub const NAME: &str = DEVICE_NAME;
+        pub const LOAD_NOTE: &str = "";
+
+        pub type NodeShard = CandleShard;
+
+        /// candle has no kernel search: `search_graphs` is not used.
+        pub fn load_shard(
+            cfg: QwenConfig,
+            range: (usize, usize),
+            weights: &str,
+            max_seq: usize,
+            _search_graphs: usize,
+            chunk: usize,
+        ) -> Result<NodeShard> {
+            CandleShard::load(
+                cfg,
+                range,
+                weights,
+                max_seq,
+                chunk,
+                &default_device(),
+                default_dtype(),
+            )
+        }
+
+        /// The whole draft model. It takes any number of tokens, so its catch-up feeds are
+        /// not cut into pieces (piece size 0).
+        pub fn load_draft(
+            cfg: QwenConfig,
+            weights: &str,
+            max_seq: usize,
+            _search_graphs: usize,
+            _chunk: usize,
+        ) -> Result<(impl TargetChain, usize)> {
+            let model = CandleShard::load(
+                cfg,
+                (0, cfg.layers),
+                weights,
+                max_seq,
+                0,
+                &default_device(),
+                default_dtype(),
+            )?;
+            Ok((model, 0))
+        }
+    }
+
+    const BACKEND: &str = backend::NAME;
 
     /// How long the head keeps retrying a node that does not answer yet (still loading).
     const CONNECT_WAIT: Duration = Duration::from_secs(15 * 60);
-
-    fn new_runtime() -> Backend {
-        Backend::default()
-    }
 
     pub fn dispatch(cmd: Cmd) -> Result<()> {
         match cmd {
@@ -312,7 +461,7 @@ mod run {
         max_seq: usize,
         search_graphs: usize,
         chunk: usize,
-    ) -> Result<TappedShards<Shard<Backend>>> {
+    ) -> Result<TappedShards<backend::NodeShard>> {
         let cfg = known_config(model)?;
         if let Some(bad) = taps.iter().find(|&&layer| layer + 1 >= cfg.layers) {
             bail!(
@@ -321,27 +470,16 @@ mod run {
             );
         }
         let weights = weights_for(model)?;
-        let ranges = tap_ranges(range, taps);
-        let parts = ranges
-            .iter()
-            .map(|&(a, b)| {
+        let parts = tap_ranges(range, taps)
+            .into_iter()
+            .map(|(a, b)| {
                 tracing::info!(
-                    "loading shard [{a},{b}) of {model} on {BACKEND} — kernel search, takes \
-                     minutes…"
+                    "loading shard [{a},{b}) of {model} on {BACKEND}{}…",
+                    backend::LOAD_NOTE
                 );
-                Shard::load_chunked(
-                    new_runtime(),
-                    cfg,
-                    (a, b),
-                    a == 0,
-                    b == cfg.layers,
-                    &weights,
-                    max_seq,
-                    search_graphs,
-                    chunk,
-                )
+                backend::load_shard(cfg, (a, b), &weights, max_seq, search_graphs, chunk)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         TappedShards::new(parts, taps.to_vec())
     }
 
@@ -456,67 +594,82 @@ mod run {
 
         let (out, stats, dt, link, rtts, how): (Vec<_>, SpecStats, f64, _, _, String);
         if let Some(repo) = &cc.drafter {
-            // A drafter that reads the target's hidden states: one block per trip.
-            let (config, weights) =
-                download_drafter(repo).map_err(|e| anyhow!("download {repo}: {e}"))?;
-            let dcfg = DsparkConfig::from_json(&std::fs::read_to_string(config)?)?;
-            dcfg.check_target(&known_config(&cc.model)?)?;
-            if dcfg.block != cc.gamma {
-                bail!(
-                    "{repo} drafts {} tokens per block: set gamma = {} in the chain config \
+            #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
+            bail!(
+                "{repo}: this build runs on candle, which has no DSpark drafter yet — remove \
+                 `drafter` from the chain config to use `draft_model`"
+            );
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+            {
+                use crate::qwen::dspark::{DsparkConfig, DsparkDraft};
+                use crate::qwen::hf::download_drafter;
+                use crate::specfeat::run_feature_decode;
+                // A drafter that reads the target's hidden states: one block per trip.
+                let (config, weights) =
+                    download_drafter(repo).map_err(|e| anyhow!("download {repo}: {e}"))?;
+                let dcfg = DsparkConfig::from_json(&std::fs::read_to_string(config)?)?;
+                dcfg.check_target(&known_config(&cc.model)?)?;
+                if dcfg.block != cc.gamma {
+                    bail!(
+                        "{repo} drafts {} tokens per block: set gamma = {} in the chain config \
                      (and --chunk {} on every node)",
-                    dcfg.block,
-                    dcfg.block,
-                    dcfg.block + 1
+                        dcfg.block,
+                        dcfg.block,
+                        dcfg.block + 1
+                    );
+                }
+                let taps: Vec<String> = dcfg.taps.iter().map(|l| l.to_string()).collect();
+                tracing::info!(
+                    "{repo} reads target layers {:?}: every remote node must be started with \
+                 --taps {}",
+                    dcfg.taps,
+                    taps.join(",")
+                );
+                let head = load_node(
+                    &cc.model,
+                    head_range,
+                    &dcfg.taps,
+                    cc.max_seq,
+                    cc.search_graphs,
+                    chunk,
+                )?;
+                tracing::info!("loading drafter {repo} on {BACKEND}…");
+                let mut draft = DsparkDraft::load(
+                    backend::Runtime::default(),
+                    dcfg,
+                    &weights,
+                    cc.max_seq,
+                    cc.search_graphs,
+                )?;
+                let mut chain = connect(head, ids.len())?;
+                let rtt_at_connect = chain.rtt();
+                let t0 = Instant::now();
+                let generated = run_feature_decode(&mut draft, &mut chain, &ids, max_new);
+                dt = t0.elapsed().as_secs_f64();
+                chain.shutdown();
+                (out, stats) = generated?;
+                link = chain.stats();
+                rtts = (rtt_at_connect, chain.rtt());
+                let d = draft.stats();
+                how = format!(
+                    "drafter {repo}: {} blocks, {:.1} ms graph + {:.1} ms markov each | {:.1} KiB \
+                 of tapped layers per result",
+                    d.drafts,
+                    d.graph.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
+                    d.markov.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
+                    link.tap_bytes as f64 / link.frames.max(1) as f64 / 1024.0,
                 );
             }
-            let taps: Vec<String> = dcfg.taps.iter().map(|l| l.to_string()).collect();
-            tracing::info!(
-                "{repo} reads target layers {:?}: every remote node must be started with \
-                 --taps {}",
-                dcfg.taps,
-                taps.join(",")
-            );
-            let head = load_node(
-                &cc.model,
-                head_range,
-                &dcfg.taps,
-                cc.max_seq,
-                cc.search_graphs,
-                chunk,
-            )?;
-            tracing::info!("loading drafter {repo} on {BACKEND}…");
-            let mut draft =
-                DsparkDraft::load(new_runtime(), dcfg, &weights, cc.max_seq, cc.search_graphs)?;
-            let mut chain = connect(head, ids.len())?;
-            let rtt_at_connect = chain.rtt();
-            let t0 = Instant::now();
-            let generated = run_feature_decode(&mut draft, &mut chain, &ids, max_new);
-            dt = t0.elapsed().as_secs_f64();
-            chain.shutdown();
-            (out, stats) = generated?;
-            link = chain.stats();
-            rtts = (rtt_at_connect, chain.rtt());
-            let d = draft.stats();
-            how = format!(
-                "drafter {repo}: {} blocks, {:.1} ms graph + {:.1} ms markov each | {:.1} KiB \
-                 of tapped layers per result",
-                d.drafts,
-                d.graph.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
-                d.markov.as_secs_f64() * 1e3 / d.drafts.max(1) as f64,
-                link.tap_bytes as f64 / link.frames.max(1) as f64 / 1024.0,
-            );
         } else {
             tracing::info!("loading draft model {} on {BACKEND}…", cc.draft_model);
-            let draft_target = QwenTarget::load_chunked(
-                new_runtime(),
+            let (draft_model, piece) = backend::load_draft(
                 known_config(&cc.draft_model)?,
                 &weights_for(&cc.draft_model)?,
                 cc.max_seq,
                 cc.search_graphs,
-                chunk, // kernels for {1, γ+1} tokens, as on the head and the remote shards
-            );
-            let mut draft = IncrementalDraft::new(draft_target, chunk);
+                chunk,
+            )?;
+            let mut draft = IncrementalDraft::new(draft_model, piece);
             let head = load_node(
                 &cc.model,
                 head_range,

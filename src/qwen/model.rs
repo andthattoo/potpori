@@ -5,67 +5,7 @@ use luminal::prelude::*;
 use luminal::shape::SymbolBounds;
 use luminal_nn::{AttentionGeometry, CacheAccess, KvCache};
 
-/// Qwen3 model configuration. Parameterized so the small draft (0.6B) and the bigger targets
-/// (1.7B, 4B) load from this one module.
-#[derive(Clone, Copy, Debug)]
-pub struct QwenConfig {
-    pub layers: usize,
-    pub hidden: usize,
-    pub intermediate: usize,
-    pub head_dim: usize,
-    pub n_heads: usize,
-    pub n_kv_heads: usize,
-    pub vocab_size: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-}
-
-impl QwenConfig {
-    pub fn q_dim(&self) -> usize {
-        self.n_heads * self.head_dim
-    }
-    pub fn kv_dim(&self) -> usize {
-        self.n_kv_heads * self.head_dim
-    }
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_groups(&self) -> usize {
-        self.n_heads / self.n_kv_heads
-    }
-
-    pub const QWEN3_0_6B: Self = Self {
-        layers: 28,
-        hidden: 1024,
-        intermediate: 3072,
-        head_dim: 128,
-        n_heads: 16,
-        n_kv_heads: 8,
-        vocab_size: 151936,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1e6,
-    };
-    pub const QWEN3_1_7B: Self = Self {
-        layers: 28,
-        hidden: 2048,
-        intermediate: 6144,
-        head_dim: 128,
-        n_heads: 16,
-        n_kv_heads: 8,
-        vocab_size: 151936,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1e6,
-    };
-    pub const QWEN3_4B: Self = Self {
-        layers: 36,
-        hidden: 2560,
-        intermediate: 9728,
-        head_dim: 128,
-        n_heads: 32,
-        n_kv_heads: 8,
-        vocab_size: 151936,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1e6,
-    };
-}
+pub use super::config::QwenConfig;
 
 #[derive(Clone, Debug)]
 pub enum TensorData {

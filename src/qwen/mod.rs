@@ -1,20 +1,51 @@
-//! Qwen3 on Luminal: the model family the chain runs today (0.6B draft; 1.7B and 4B targets).
+//! Qwen3: the model family the chain runs today (0.6B draft; 1.7B and 4B targets), on Luminal
+//! (`engine` and its backend features) or on candle (`candle`).
 //!
-//! - [`model`] builds the graph for a contiguous layer range; [`runtime`] holds the CUDA and
-//!   Metal adapters that compile and execute it.
-//! - [`hf`] downloads and prepares weights; [`tok`] is the tokenizer and chat template.
-//! - [`shard`] runs one layer range and plugs into the chain protocol ([`crate::node`]).
-//! - [`target`] runs a whole model in one process: the draft model, and the single-process
-//!   baseline in tests. [`draft`] wraps it as the head's incremental draft engine.
+//! - [`config`] is the model geometry; [`hf`] downloads and prepares weights; [`tok`] is the
+//!   tokenizer and chat template. [`draft`] turns a whole model into the head's incremental
+//!   draft engine. These are shared by both backends.
+//! - Luminal: [`model`] builds the graph for a contiguous layer range; [`runtime`] holds the
+//!   CUDA and Metal adapters that compile and execute it; [`shard`] runs one layer range and
+//!   plugs into the chain protocol ([`crate::node`]); [`target`] runs a whole model in one
+//!   process; [`dspark`] is the DSpark drafter.
+//! - candle: [`candle_shard`] is the shard and the whole model in one type.
 
+pub mod config;
 pub mod draft;
-pub mod dspark;
 pub mod hf;
-pub mod model;
-pub mod runtime;
-pub mod shard;
-pub mod target;
 pub mod tok;
+
+// The Luminal half. Without one of its backends nothing calls it.
+#[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub mod dspark;
+#[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub mod model;
+#[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub mod runtime;
+#[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub mod shard;
+#[cfg(feature = "engine")]
+#[cfg_attr(
+    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub mod target;
 
 // GPU integration tests (`--ignored`): CUDA on a tiny generated model and on real weights,
 // and the chain protocol over real Metal shards.
@@ -35,19 +66,51 @@ mod dspark_check;
 mod metal_profile;
 #[cfg(all(test, any(feature = "cuda", feature = "reference", feature = "candle")))]
 mod tiny;
-// Prototype candle backend; only the tests call it so far.
+// The candle backend. `serve` and `chat` run on it unless a Luminal backend is enabled too;
+// then only the tests call it.
 #[cfg(feature = "candle")]
-#[allow(dead_code)]
+#[cfg_attr(
+    any(feature = "cuda", all(feature = "metal", target_os = "macos")),
+    allow(dead_code)
+)]
 pub mod candle_shard;
 
 use crate::engine::TokenId;
-use model::QwenConfig;
+use config::QwenConfig;
 
 /// Tokens that end a Qwen3 generation: `<|im_end|>` and `<|endoftext|>`.
 pub const EOS_TOKENS: [TokenId; 2] = [151645, 151643];
 
 pub fn is_eos(token: TokenId) -> bool {
     EOS_TOKENS.contains(&token)
+}
+
+/// Greedy pick over one row of logits. Panics on empty or non-finite logits: in a local model
+/// that is a broken kernel, and continuing would only produce garbage tokens.
+pub(crate) fn argmax(row: &[f32]) -> TokenId {
+    crate::engine::argmax(row).expect("non-finite or empty logits")
+}
+
+/// Plain greedy decode through the verify primitive, one token per step: the reference the
+/// speculative drivers are compared against in the GPU tests.
+#[cfg(all(
+    test,
+    any(all(feature = "metal", target_vendor = "apple"), feature = "candle")
+))]
+pub(crate) fn greedy<T: crate::engine::TargetChain>(
+    t: &mut T,
+    prompt: &[TokenId],
+    max_new: usize,
+) -> Vec<TokenId> {
+    let mut cur = t.prefill(prompt);
+    let mut out = Vec::new();
+    let mut base = prompt.len() as u32;
+    while !t.is_eos(cur) && out.len() < max_new {
+        out.push(cur);
+        cur = t.verify(base, cur, &[])[0];
+        base += 1;
+    }
+    out
 }
 
 /// Map an HF repo name to a known Qwen3 config. Exact match only.

@@ -1,7 +1,7 @@
 //! A tiny generated Qwen model and an independent scalar forward pass: enough to check the
 //! real graph, the shard cut and the absolute-position rollback on any runtime, with no
 //! download.
-use super::model::QwenConfig;
+use super::config::QwenConfig;
 use crate::engine::TokenId;
 use crate::node::ShardEngine;
 
@@ -157,7 +157,6 @@ pub fn shards_and_rollback<R: super::target::QwenRuntime + Default + 'static>() 
 pub fn check_shards_and_rollback<S: ShardEngine>(
     load: impl Fn(QwenConfig, (usize, usize), &str) -> S,
 ) {
-    use super::model::QwenGraph;
     use safetensors::{tensor::TensorView, Dtype};
     let cfg = QwenConfig {
         layers: 2,
@@ -170,20 +169,19 @@ pub fn check_shards_and_rollback<S: ShardEngine>(
         rms_norm_eps: 1e-6,
         rope_theta: 10000.,
     };
-    let graph = QwenGraph::build(cfg, (0, 2), true, true, 8, 2).unwrap();
-    let tensors: Vec<_> = graph
-        .parameters
-        .iter()
+    let tensors: Vec<_> = cfg
+        .parameters()
+        .into_iter()
         .enumerate()
-        .map(|(seed, p)| {
-            let values = (0..p.shape.iter().product::<usize>()).map(|i| {
-                if p.name.contains("norm") {
+        .map(|(seed, (name, shape))| {
+            let values = (0..shape.iter().product::<usize>()).map(|i| {
+                if name.contains("norm") {
                     1.
                 } else {
                     ((i + seed * 13) as f32 * 0.37).sin() * 0.1
                 }
             });
-            let (dtype, bytes) = if p.name.contains("norm") {
+            let (dtype, bytes) = if name.contains("norm") {
                 (
                     Dtype::F32,
                     values.flat_map(f32::to_le_bytes).collect::<Vec<_>>(),
@@ -196,7 +194,7 @@ pub fn check_shards_and_rollback<S: ShardEngine>(
                         .collect(),
                 )
             };
-            (p.name.clone(), p.shape.clone(), dtype, bytes)
+            (name, shape, dtype, bytes)
         })
         .collect();
     let reference_weights = tensors

@@ -226,6 +226,7 @@ fn valid_combined_file(path: &Path) -> bool {
 }
 
 /// Load only this shard's declared parameter ports. Byte decoding does not assume mmap alignment.
+#[cfg(feature = "engine")]
 pub fn load_inputs(
     graph: &super::model::QwenGraph,
     path: &Path,
@@ -274,6 +275,7 @@ pub fn load_inputs(
 }
 
 /// Read one tensor of a safetensors file as f32, checking its shape.
+#[cfg(feature = "engine")] // the DSpark drafter reads its checkpoint with these
 pub fn read_f32(path: &Path, name: &str, shape: &[usize]) -> anyhow::Result<Vec<f32>> {
     let file = File::open(path)?;
     // SAFETY: model files are immutable and stay mapped throughout decoding.
@@ -286,6 +288,7 @@ pub fn read_f32(path: &Path, name: &str, shape: &[usize]) -> anyhow::Result<Vec<
 
 /// Whether tensors `a` and `b` of a safetensors file hold the same values — tied weights
 /// saved twice. A missing `b` counts as tied.
+#[cfg(feature = "engine")]
 pub fn same_tensor(path: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
     let file = File::open(path)?;
     // SAFETY: model files are immutable and stay mapped throughout the comparison.
@@ -330,6 +333,7 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
 
 /// Download a DSpark drafter checkpoint; returns the paths of its `config.json` and
 /// `model.safetensors`. The file is used as published, with no preparation step.
+#[cfg(feature = "engine")]
 pub fn download_drafter(repo_id: &str) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let repo = Api::new()?.model(repo_id.to_string());
     Ok((repo.get("config.json")?, repo.get("model.safetensors")?))

@@ -20,10 +20,12 @@ use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device};
 
-use super::candle_shard::{default_device, CandleShard};
+use super::candle_shard::{default_device, default_dtype, CandleShard};
+use super::config::QwenConfig;
+use super::draft::IncrementalDraft;
+use super::greedy;
 use super::hf::{prepare_hf_model, COMBINED_WEIGHTS_FILE};
-use super::model::QwenConfig;
-use super::target::greedy;
+use super::tok::ChatTokenizer;
 use super::EOS_TOKENS;
 use crate::engine::{DraftEngine, TargetChain, TokenId};
 use crate::node::{serve_middle, serve_tail, ChainLink};
@@ -60,42 +62,43 @@ fn candle_tiny_gpu_shards_and_rollback() {
     });
 }
 
-fn dtype() -> DType {
-    match std::env::var("POTPORI_CANDLE_DTYPE").as_deref() {
-        Ok("bf16") => DType::BF16,
-        _ => DType::F32,
-    }
-}
+/// A model the tests load: its HF repo and geometry.
+type Model = (&'static str, QwenConfig);
+const SMALL: Model = ("Qwen/Qwen3-0.6B", CFG);
 
-fn weights() -> String {
-    let dir = prepare_hf_model("Qwen/Qwen3-0.6B").expect("prepare 0.6B");
-    dir.join(COMBINED_WEIGHTS_FILE)
-        .to_str()
-        .unwrap()
-        .to_string()
-}
-
-fn load(layers: (usize, usize), chunk: usize, max_seq: usize) -> CandleShard {
+fn load_of(
+    (repo, cfg): Model,
+    layers: (usize, usize),
+    chunk: usize,
+    max_seq: usize,
+) -> CandleShard {
+    let dir = prepare_hf_model(repo).expect("prepare weights");
+    let weights = dir.join(COMBINED_WEIGHTS_FILE);
     let t0 = Instant::now();
     let shard = CandleShard::load(
-        CFG,
+        cfg,
         layers,
-        &weights(),
+        weights.to_str().unwrap(),
         max_seq,
         chunk,
         &default_device(),
-        dtype(),
+        default_dtype(),
     )
     .expect("load candle shard");
     println!(
-        "[candle] layers {layers:?} loaded in {:.2} s",
+        "[candle] {repo} layers {layers:?} loaded in {:.2} s",
         t0.elapsed().as_secs_f64()
     );
     shard
 }
 
+fn load(layers: (usize, usize), chunk: usize, max_seq: usize) -> CandleShard {
+    load_of(SMALL, layers, chunk, max_seq)
+}
+
 /// A remote node on its own thread, loading then listening like `potpori serve`.
 fn spawn_remote(
+    model: Model,
     layers: (usize, usize),
     downstream: Option<Receiver<SocketAddr>>,
     chunk: usize,
@@ -104,7 +107,7 @@ fn spawn_remote(
 ) -> (Receiver<SocketAddr>, JoinHandle<()>) {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let mut shard = load(layers, chunk, max_seq);
+        let mut shard = load_of(model, layers, chunk, max_seq);
         let downstream = downstream.map(|ready| ready.recv().expect("downstream addr"));
         let tls = TlsIdentity::for_tests();
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -184,6 +187,7 @@ fn delayed(target: SocketAddr, micros: Arc<AtomicU64>) -> SocketAddr {
 /// Load every node of `plan` and connect the head to the chain over loopback QUIC, through a
 /// [`delayed`] relay on every hop when `delay` is given.
 fn chain(
+    model: Model,
     plan: &[(usize, usize)],
     chunk: usize,
     max_seq: usize,
@@ -192,11 +196,12 @@ fn chain(
     let mut handles = Vec::new();
     let mut next: Option<Receiver<SocketAddr>> = None;
     for &layers in plan[1..].iter().rev() {
-        let (ready, handle) = spawn_remote(layers, next.take(), chunk, max_seq, delay.clone());
+        let (ready, handle) =
+            spawn_remote(model, layers, next.take(), chunk, max_seq, delay.clone());
         next = Some(ready);
         handles.push(handle);
     }
-    let head = load(plan[0], chunk, max_seq);
+    let head = load_of(model, plan[0], chunk, max_seq);
     let addr = next.unwrap().recv().expect("node addr");
     let link = ChainLink::connect(
         head,
@@ -321,7 +326,7 @@ fn candle_chain_equals_single_process() {
         vec![(0, l / 2), (l / 2, l)],
         vec![(0, l / 3), (l / 3, 2 * l / 3), (2 * l / 3, l)],
     ] {
-        let (mut link, handles) = chain(&plan, 8, 512, None);
+        let (mut link, handles) = chain(SMALL, &plan, 8, 512, None);
         let out = greedy(&mut Blocking(&mut link), &PROMPT, 24);
         finish(link, handles);
         println!(
@@ -339,7 +344,7 @@ fn candle_chain_equals_single_process() {
 fn candle_pipelined_chain_equals_greedy() {
     let k = CFG.layers / 2;
     let base = greedy(&mut load((0, CFG.layers), 5, 512), &PROMPT, 24);
-    let (mut link, handles) = chain(&[(0, k), (k, CFG.layers)], 5, 512, None); // chunk = gamma + 1
+    let (mut link, handles) = chain(SMALL, &[(0, k), (k, CFG.layers)], 5, 512, None); // chunk = gamma + 1
     let cfg = SpecConfig {
         gamma: 4,
         max_new: 24,
@@ -373,7 +378,7 @@ fn candle_pipeline_throughput() {
     );
     drop(single);
 
-    let (mut link, handles) = chain(&[(0, k), (k, CFG.layers)], chunk, 768, None);
+    let (mut link, handles) = chain(SMALL, &[(0, k), (k, CFG.layers)], chunk, 768, None);
     let cfg = SpecConfig {
         gamma: chunk - 1,
         max_new: 200,
@@ -447,7 +452,7 @@ fn candle_chain_under_latency() {
         vec![(0, l / 3), (l / 3, 2 * l / 3), (2 * l / 3, l)],
     ] {
         let delay = Arc::new(AtomicU64::new(0));
-        let (mut link, handles) = chain(&plan, chunk, 768, Some(delay.clone()));
+        let (mut link, handles) = chain(SMALL, &plan, chunk, 768, Some(delay.clone()));
         let (truth, _) = run_spec_decode_pipelined(&mut NgramDraft, &mut link, &prompt, &cfg, 1)
             .expect("reference generation");
         println!("\n{}-node chain", plan.len());
@@ -487,4 +492,94 @@ fn candle_chain_under_latency() {
         }
         finish(link, handles);
     }
+}
+
+// The real pairing under a round trip: Qwen3-0.6B drafts on the head for a 2-node Qwen3-1.7B
+// chain, as `potpori chat` runs it, with every hop held for 0, 10 and 50 ms each way. Three
+// chat prompts, depth 1 to 4. Tokens per chunk is the draft's real acceptance; it does not
+// depend on timing. Every run must equal plain greedy decode over the same chain.
+// `POTPORI_GAMMA` and `POTPORI_ONE_WAY_MS` as in `candle_chain_under_latency`.
+#[test]
+#[ignore = "downloads Qwen3-0.6B and Qwen3-1.7B; a GPU with candle-cuda"]
+fn candle_real_draft_under_latency() {
+    const TARGET: Model = ("Qwen/Qwen3-1.7B", QwenConfig::QWEN3_1_7B);
+    let gamma: usize = std::env::var("POTPORI_GAMMA")
+        .ok()
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(7);
+    let chunk = gamma + 1;
+    let delays: Vec<u64> = std::env::var("POTPORI_ONE_WAY_MS")
+        .unwrap_or_else(|_| "0,10,50".to_string())
+        .split(',')
+        .map(|ms| ms.trim().parse().expect("POTPORI_ONE_WAY_MS: milliseconds"))
+        .collect();
+    let max_new = 96;
+    let cfg = SpecConfig { gamma, max_new };
+    let tok = ChatTokenizer::load(TARGET.0).expect("tokenizer");
+    let prompts: Vec<Vec<TokenId>> = [
+        "Explain in a few sentences why the sky is blue.",
+        "Write a Python function that returns the n-th Fibonacci number.",
+        "Give me three tips for a first trip to Istanbul.",
+    ]
+    .iter()
+    .map(|p| tok.encode_chat(p).expect("encode"))
+    .collect();
+
+    let l = TARGET.1.layers;
+    let delay = Arc::new(AtomicU64::new(0));
+    let (mut link, handles) = chain(
+        TARGET,
+        &[(0, l / 2), (l / 2, l)],
+        chunk,
+        768,
+        Some(delay.clone()),
+    );
+    let mut draft = IncrementalDraft::new(load((0, CFG.layers), 0, 768), 0);
+    let _ = draft.draft(&prompts[0], gamma); // warm-up
+    let truth: Vec<Vec<TokenId>> = prompts
+        .iter()
+        .map(|p| greedy(&mut Blocking(&mut link), p, max_new))
+        .collect();
+    println!(
+        "\ngamma {gamma}: {} drafts for a 2-node {} chain, {} tokens over {} prompts",
+        SMALL.0,
+        TARGET.0,
+        truth.iter().map(Vec::len).sum::<usize>(),
+        prompts.len()
+    );
+    for &one_way_ms in &delays {
+        delay.store(one_way_ms * 1000, Ordering::Relaxed);
+        // Plain greedy first: it also lets QUIC's round-trip estimate settle.
+        let t0 = Instant::now();
+        let plain = greedy(&mut Blocking(&mut link), &prompts[0], 24);
+        let plain_rate = plain.len() as f64 / t0.elapsed().as_secs_f64();
+        println!(
+            "{one_way_ms} ms each way (QUIC rtt {:.1} ms): plain greedy {plain_rate:.1} tok/s",
+            link.rtt().as_secs_f64() * 1e3
+        );
+        for depth in [1, 2, 4] {
+            let (mut tokens, mut chunks, mut secs) = (0, 0, 0.);
+            for (prompt, want) in prompts.iter().zip(&truth) {
+                let t0 = Instant::now();
+                let (out, st) =
+                    run_spec_decode_pipelined(&mut draft, &mut link, prompt, &cfg, depth)
+                        .expect("generation");
+                secs += t0.elapsed().as_secs_f64();
+                let same = out.iter().zip(want).take_while(|(a, b)| a == b).count();
+                assert!(
+                    &out == want,
+                    "depth {depth} differs from greedy at token {same} of {}",
+                    want.len()
+                );
+                tokens += out.len();
+                chunks += st.traversals;
+            }
+            println!(
+                "  depth {depth}: {:6.1} tok/s | {chunks} chunks, {:.2} tokens per chunk",
+                tokens as f64 / secs,
+                tokens as f64 / chunks as f64
+            );
+        }
+    }
+    finish(link, handles);
 }

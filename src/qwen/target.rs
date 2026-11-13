@@ -6,11 +6,9 @@ use super::{model::QwenConfig, shard::Shard};
 use crate::engine::{TargetChain, TokenId};
 use crate::node::ShardEngine;
 
-/// Greedy pick over one row of logits. Panics on empty or non-finite logits: in a local model
-/// that is a broken kernel, and continuing would only produce garbage tokens.
-pub(crate) fn argmax(row: &[f32]) -> TokenId {
-    crate::engine::argmax(row).expect("non-finite or empty logits")
-}
+pub(crate) use super::argmax;
+#[cfg(all(test, feature = "metal", target_vendor = "apple"))]
+pub(crate) use super::greedy;
 
 pub struct QwenTarget<R: QwenRuntime> {
     shard: Shard<R>,
@@ -93,28 +91,6 @@ impl<R: QwenRuntime + 'static> TargetChain for QwenTarget<R> {
     fn is_eos(&self, token: TokenId) -> bool {
         super::is_eos(token)
     }
-}
-
-/// Plain greedy decode through the verify primitive, one token per step: the reference the
-/// speculative drivers are compared against in the Metal tests.
-#[cfg(all(
-    test,
-    any(all(feature = "metal", target_vendor = "apple"), feature = "candle")
-))]
-pub(crate) fn greedy<T: TargetChain>(
-    t: &mut T,
-    prompt: &[TokenId],
-    max_new: usize,
-) -> Vec<TokenId> {
-    let mut cur = t.prefill(prompt);
-    let mut out = Vec::new();
-    let mut base = prompt.len() as u32;
-    while !t.is_eos(cur) && out.len() < max_new {
-        out.push(cur);
-        cur = t.verify(base, cur, &[])[0];
-        base += 1;
-    }
-    out
 }
 
 #[cfg(all(test, feature = "metal", target_vendor = "apple"))]

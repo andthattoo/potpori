@@ -2,19 +2,19 @@
 //! generation, so each call only pays for tokens it has not seen.
 //!
 //! Each `draft()` call first feeds whatever part of the context differs from what the model
-//! was last fed (in pieces matching its compiled kernels), then greedily speculates γ tokens.
+//! was last fed (in pieces the model accepts), then greedily speculates γ tokens.
 //! The speculative tokens stay in the KV: when the driver echoes them back as context they
 //! cost nothing, and when the driver rejects them the next call overwrites them from the
 //! first position that differs — the same absolute-position overwrite the target chain uses.
 
 use crate::engine::{DraftEngine, TargetChain, TokenId};
 
-use super::target::{QwenRuntime, QwenTarget};
-
-pub struct IncrementalDraft<R: QwenRuntime + 'static> {
-    model: QwenTarget<R>,
+/// `M` is a whole model in one process, on any backend.
+pub struct IncrementalDraft<M: TargetChain> {
+    model: M,
     /// Catch-up feeds pieces of exactly this many tokens (+ single-token remainder), matching
-    /// the model's compiled point buckets {1, chunk}. 0/1 = single-token feeds only.
+    /// a model with kernels for {1, chunk} tokens. 1 = single-token feeds only; 0 = the model
+    /// takes any number of tokens, so a catch-up is one feed.
     chunk: usize,
     /// The exact tokens we have fed at absolute positions `0..fed.len()` (committed AND
     /// speculative). Catch-up only re-feeds positions where the caller's context differs —
@@ -23,8 +23,8 @@ pub struct IncrementalDraft<R: QwenRuntime + 'static> {
     fed: Vec<TokenId>,
 }
 
-impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
-    pub fn new(model: QwenTarget<R>, chunk: usize) -> Self {
+impl<M: TargetChain> IncrementalDraft<M> {
+    pub fn new(model: M, chunk: usize) -> Self {
         Self {
             model,
             chunk,
@@ -32,13 +32,15 @@ impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
         }
     }
 
-    /// Feed `ctx[from..to]` at absolute positions `from..to` in point-bucket-sized pieces;
+    /// Feed `ctx[from..to]` at absolute positions `from..to` in pieces the model accepts;
     /// return the model's prediction for position `to`.
     fn feed_range(&mut self, ctx: &[TokenId], from: usize, to: usize) -> TokenId {
         let mut pos = from;
         let mut last = 0;
         while pos < to {
-            let take = if self.chunk > 1 && to - pos >= self.chunk {
+            let take = if self.chunk == 0 {
+                to - pos
+            } else if self.chunk > 1 && to - pos >= self.chunk {
                 self.chunk
             } else {
                 1
@@ -55,7 +57,7 @@ impl<R: QwenRuntime + 'static> IncrementalDraft<R> {
     }
 }
 
-impl<R: QwenRuntime + 'static> DraftEngine for IncrementalDraft<R> {
+impl<M: TargetChain> DraftEngine for IncrementalDraft<M> {
     fn capacity(&self) -> usize {
         self.model.capacity()
     }

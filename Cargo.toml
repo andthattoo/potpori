@@ -13,11 +13,8 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Inference-engine deps (Luminal model graph + safetensors weight loading + tokenizer);
-# enabled by a backend feature.
-engine = [
-    "dep:luminal",
-    "dep:luminal_nn",
+# Weight download and preparation, and the tokenizer: what every model backend needs.
+weights = [
     "dep:hf-hub",
     "dep:safetensors",
     "dep:bytemuck",
@@ -26,15 +23,18 @@ engine = [
     "dep:serde_json",
     "dep:tempfile",
 ]
+# The Luminal model graph on top of `weights`; enabled by a Luminal backend feature.
+engine = ["dep:luminal", "dep:luminal_nn", "weights"]
 # Backend selectors: pull in the Luminal backend crate (+ the engine deps) for the accelerator.
 cuda = ["dep:luminal_cuda_lite", "luminal_cuda_lite/device", "dep:cudarc", "engine"]
 metal = ["dep:luminal_metal", "dep:metal", "dep:objc", "engine"]
 # Luminal's CPU reference executor: slow, exact, no GPU. Tests only — it runs the real graphs
 # on tiny models, so graph changes can be checked anywhere.
 reference = ["dep:luminal_reference", "engine"]
-# Prototype: Qwen shards on candle instead of Luminal (CPU; `candle-cuda` for NVIDIA, `candle-metal` for Apple). Same
-# ShardEngine contract, so candle and Luminal nodes can share a chain. Tests only so far.
-candle = ["dep:candle-core", "dep:candle-nn", "engine"]
+# Qwen shards on candle instead of Luminal (CPU; `candle-cuda` for NVIDIA, `candle-metal` for
+# Apple). Same ShardEngine contract, so candle and Luminal nodes can share a chain. Builds
+# without Luminal; `serve` and `chat` run on candle when no Luminal backend is enabled.
+candle = ["dep:candle-core", "dep:candle-nn", "weights"]
 candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
 candle-metal = ["candle", "candle-core/metal", "candle-nn/metal"]
 
