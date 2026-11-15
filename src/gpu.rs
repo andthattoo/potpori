@@ -14,15 +14,25 @@ use cudarc::driver::{result, sys};
 /// The kernels, compiled by `build.rs`.
 const PTX: &str = concat!(include_str!(concat!(env!("OUT_DIR"), "/kernels.ptx")), "\0");
 
-const KERNELS: [&str; 14] = [
-    "embed", "rmsnorm", "gemm_t1", "gemm_t2", "gemm_t4", "gemm_t8", "silu_mul", "rope", "attn",
-    "conv2", "gemm4_t1", "gemm4_t2", "gemm4_t4", "gemm4_t8",
+const KERNELS: [&str; 18] = [
+    "embed", "rmsnorm", "gemm_t1", "gemm_t2", "gemm_t4", "gemm_t8", "silu_mul", "rope", "attn_t1",
+    "attn_t2", "attn_t4", "attn_t8", "conv2", "gemm4_t1", "gemm4_t2", "gemm4_t4", "gemm4_t8",
+    "topk",
 ];
+
+/// The tensor-core products, compiled for RTX 30-series cards and newer.
+const PTX_TC: &str = concat!(
+    include_str!(concat!(env!("OUT_DIR"), "/kernels_tc.ptx")),
+    "\0"
+);
+
+const KERNELS_TC: [&str; 1] = ["gemm4_tc"];
 
 pub struct Gpu {
     ctx: sys::CUcontext,
     funcs: HashMap<&'static str, sys::CUfunction>,
     name: String,
+    tensor_cores: bool,
 }
 
 // SAFETY: a CUDA context and its function handles may be used from any thread once the
@@ -86,15 +96,48 @@ impl Gpu {
             let f = unsafe { result::module::get_function(module, CString::new(name).unwrap())? };
             funcs.insert(name, f);
         }
+        // SAFETY: `dev` is a valid device.
+        let major = unsafe {
+            result::device::get_attribute(
+                dev,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )?
+        };
+        let tensor_cores = major >= 8 && std::env::var_os("POTPORI_NO_TC").is_none();
+        if tensor_cores {
+            // SAFETY: PTX_TC is NUL-terminated text.
+            let module = unsafe { result::module::load_data(PTX_TC.as_ptr() as *const c_void)? };
+            for name in KERNELS_TC {
+                let f =
+                    unsafe { result::module::get_function(module, CString::new(name).unwrap())? };
+                funcs.insert(name, f);
+            }
+        }
         Ok(Self {
             ctx,
             funcs,
-            name: result::device::get_name(dev)?,
+            name: format!(
+                "{} ({})",
+                result::device::get_name(dev)?,
+                if tensor_cores {
+                    "tensor-core products"
+                } else {
+                    "scalar products"
+                }
+            ),
+            tensor_cores,
         })
     }
 
+    /// The device's name and which matrix products it runs.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the matrix products run on tensor cores: an RTX 30-series card or newer, and
+    /// `POTPORI_NO_TC` unset. They then round their inputs to bf16.
+    pub fn tensor_cores(&self) -> bool {
+        self.tensor_cores
     }
 
     /// Free and total device memory, in bytes.

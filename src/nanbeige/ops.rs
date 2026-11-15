@@ -32,6 +32,13 @@ pub fn rmsnorm(out: u64, x: u64, w: &Buf<f32>, eps: f32, n: usize, rows: usize) 
     );
 }
 
+/// Whether a 4-bit product with `n_in` input columns runs on tensor cores, which round each
+/// input to bf16 (nearest, ties to even) first: on cards that have them. Products with bf16
+/// weights never do: they are bound by reading the weights, and gain nothing.
+pub fn rounds_input(n_in: usize) -> bool {
+    gpu().tensor_cores() && n_in.is_multiple_of(16)
+}
+
 /// `out[t, :n_out] (+)= w x[t, :]` for `s` tokens; `out` rows are `out_stride` long.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm(
@@ -87,6 +94,25 @@ pub fn gemm4(
     debug_assert!(n_in.is_multiple_of(16));
     debug_assert_eq!(w.len(), n_out * n_in / 2);
     debug_assert_eq!(scale.len(), n_out * n_in / 16);
+    if rounds_input(n_in) {
+        return gpu().launch(
+            "gemm4_tc",
+            (n_out.div_ceil(32), s.div_ceil(8)),
+            256,
+            &[
+                out.into(),
+                x.into(),
+                w.ptr().into(),
+                scale.ptr().into(),
+                (global / 2048.0).into(),
+                n_out.into(),
+                n_in.into(),
+                s.into(),
+                out_stride.into(),
+                (add as i32).into(),
+            ],
+        );
+    }
     let kernel = match s {
         1 => "gemm4_t1",
         2 => "gemm4_t2",
@@ -167,9 +193,16 @@ pub fn attn(
         "attention span exceeds the cache"
     );
     debug_assert!(scratch.len() >= s * heads * cap);
+    // Tokens are taken in tiles that share each key and value; see `attn_impl`.
+    let (kernel, tile) = match s {
+        1 => ("attn_t1", 1),
+        2 => ("attn_t2", 2),
+        3 | 4 => ("attn_t4", 4),
+        _ => ("attn_t8", 8),
+    };
     gpu().launch(
-        "attn",
-        (heads, s),
+        kernel,
+        (heads, s.div_ceil(tile)),
         HEAD_DIM,
         &[
             out.into(),
@@ -183,6 +216,7 @@ pub fn attn(
             step.into(),
             cap.into(),
             (1.0 / (HEAD_DIM as f32).sqrt()).into(),
+            s.into(),
         ],
     );
 }
@@ -214,6 +248,25 @@ pub fn conv2(
             group.into(),
             side.into(),
             (add as i32).into(),
+        ],
+    );
+}
+
+/// The `k` largest of each of `rows` rows of `vocab` logits, largest first and ties to the
+/// lower index: `ids` and `vals` are `[rows, k]`. A row holding a NaN or an infinity gets
+/// `ids[row, 0] = -1`.
+pub fn topk(ids: &Buf<i32>, vals: &Buf<f32>, logits: u64, vocab: usize, k: usize, rows: usize) {
+    debug_assert!(k <= vocab && ids.len() >= rows * k && vals.len() >= rows * k);
+    gpu().launch(
+        "topk",
+        (rows, 1),
+        1024,
+        &[
+            ids.ptr().into(),
+            vals.ptr().into(),
+            logits.into(),
+            vocab.into(),
+            k.into(),
         ],
     );
 }

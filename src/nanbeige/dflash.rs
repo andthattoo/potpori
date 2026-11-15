@@ -85,6 +85,9 @@ pub struct Dflash {
     scratch: Buf<f32>,
     logits: Buf<f32>,
     hp: Buf<f32>,
+    /// The `selector_top_k` most likely tokens of each masked slot, and their logits.
+    cand_ids: Buf<i32>,
+    cand_vals: Buf<f32>,
     stats: DraftStats,
 }
 
@@ -199,6 +202,8 @@ impl Dflash {
             scratch: Buf::zeros(block * cfg.n_heads * max_seq),
             logits: Buf::zeros((block - 1) * cfg.vocab),
             hp: Buf::zeros((block - 1) * rank),
+            cand_ids: Buf::zeros((block - 1) * cfg.selector_top_k),
+            cand_vals: Buf::zeros((block - 1) * cfg.selector_top_k),
             stats: DraftStats::default(),
             cfg,
         })
@@ -355,10 +360,20 @@ impl FeatureDraft for Dflash {
             rank,
             false,
         );
-        let logits = self.logits.read(0, n * vocab);
+        let k = self.selector.top_k;
+        ops::topk(
+            &self.cand_ids,
+            &self.cand_vals,
+            self.logits.ptr(),
+            vocab,
+            k,
+            n,
+        );
+        let ids = self.cand_ids.read(0, n * k);
+        let vals = self.cand_vals.read(0, n * k);
         let hp = self.hp.read(0, n * rank);
         let t1 = Instant::now();
-        let tokens = self.selector.pick(anchor, &logits, &hp)?;
+        let tokens = self.selector.pick(anchor, &ids, &vals, &hp)?;
         self.stats.drafts += 1;
         self.stats.gpu += t1 - t0;
         self.stats.host += t1.elapsed();
@@ -379,9 +394,17 @@ pub struct Selector {
 }
 
 impl Selector {
-    /// One token per slot. `logits` is `[slots, vocab]`, `hp` is `[slots, rank]`.
-    pub fn pick(&self, anchor: TokenId, logits: &[f32], hp: &[f32]) -> Result<Vec<TokenId>> {
-        let (rank, vocab) = (self.rank, self.vocab);
+    /// One token per slot. `ids` and `vals` are `[slots, top_k]`: each slot's most likely
+    /// tokens, most likely first, and their logits, as [`ops::topk`] returns them; `hp` is
+    /// `[slots, rank]`.
+    pub fn pick(
+        &self,
+        anchor: TokenId,
+        ids: &[i32],
+        vals: &[f32],
+        hp: &[f32],
+    ) -> Result<Vec<TokenId>> {
+        let (rank, k) = (self.rank, self.top_k);
         let row = |table: &[u16], token: usize| -> Vec<f32> {
             table[token * rank..(token + 1) * rank]
                 .iter()
@@ -389,9 +412,9 @@ impl Selector {
                 .collect()
         };
         let mut previous = anchor as usize;
-        let mut out = Vec::with_capacity(logits.len() / vocab);
-        for (slot, h) in logits.chunks(vocab).zip(hp.chunks(rank)) {
-            if slot.iter().any(|x| !x.is_finite()) {
+        let mut out = Vec::with_capacity(ids.len() / k);
+        for ((ids, vals), h) in ids.chunks(k).zip(vals.chunks(k)).zip(hp.chunks(rank)) {
+            if ids[0] < 0 || ids.iter().any(|&t| t as usize >= self.vocab) {
                 bail!("the drafter produced non-finite logits");
             }
             // The transition weights for this slot: predecessor row scaled by the hidden state.
@@ -401,13 +424,14 @@ impl Selector {
                 .map(|(a, b)| a * b)
                 .collect();
             let mut best = (f32::NEG_INFINITY, 0usize);
-            for token in top_k(slot, self.top_k) {
+            for (&token, &logit) in ids.iter().zip(vals) {
+                let token = token as usize;
                 let pair: f32 = row(&self.successor, token)
                     .iter()
                     .zip(&pred)
                     .map(|(s, p)| s * p)
                     .sum();
-                let score = slot[token] + pair;
+                let score = logit + pair;
                 if score > best.0 {
                     best = (score, token);
                 }
@@ -419,7 +443,26 @@ impl Selector {
     }
 }
 
+/// What [`ops::topk`] computes, on the host: each row's `k` most likely tokens and their
+/// logits, with `-1` first for a row that holds a NaN or an infinity.
+#[cfg(test)]
+pub fn rank(logits: &[f32], vocab: usize, k: usize) -> (Vec<i32>, Vec<f32>) {
+    let (mut ids, mut vals) = (Vec::new(), Vec::new());
+    for row in logits.chunks(vocab) {
+        let top = top_k(row, k);
+        let bad = row.iter().any(|x| !x.is_finite());
+        ids.extend(
+            top.iter()
+                .enumerate()
+                .map(|(i, &t)| if bad && i == 0 { -1 } else { t as i32 }),
+        );
+        vals.extend(top.iter().map(|&t| row[t]));
+    }
+    (ids, vals)
+}
+
 /// Indices of the `k` largest values, largest first; ties go to the lower index.
+#[cfg(test)]
 fn top_k(values: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..values.len()).collect();
     let order = |a: &usize, b: &usize| values[*b].total_cmp(&values[*a]).then(a.cmp(b));
@@ -458,10 +501,14 @@ mod tests {
         };
         let logits = [1.0, 0.0, 0.5, 1.0, 0.0, 0.5];
         let hp = [1.0, 1.0];
-        assert_eq!(sel.pick(0, &logits, &hp).unwrap(), vec![2, 1]);
+        let pick = |sel: &Selector, logits: &[f32], hp: &[f32]| {
+            let (ids, vals) = rank(logits, 3, sel.top_k);
+            sel.pick(0, &ids, &vals, hp)
+        };
+        assert_eq!(pick(&sel, &logits, &hp).unwrap(), vec![2, 1]);
         // With top_k = 1 only the most likely token is a candidate.
         let greedy = Selector { top_k: 1, ..sel };
-        assert_eq!(greedy.pick(0, &logits, &hp).unwrap(), vec![0, 0]);
-        assert!(greedy.pick(0, &[f32::NAN, 0.0, 0.0], &[1.0]).is_err());
+        assert_eq!(pick(&greedy, &logits, &hp).unwrap(), vec![0, 0]);
+        assert!(pick(&greedy, &[f32::NAN, 0.0, 0.0], &[1.0]).is_err());
     }
 }

@@ -2,6 +2,8 @@
 //! kernels are checked against. Written from the published architectures, not from the GPU
 //! code, and far too slow for anything but generated models of a few hundred channels.
 
+use half::bf16;
+
 use super::config::{rope_table, Config, DraftConfig, HEAD_DIM};
 use super::weights::Checkpoint;
 
@@ -110,6 +112,18 @@ impl<'a> RefTarget<'a> {
         self.ck.dense(name, shape).unwrap()
     }
 
+    /// The matrix `name` times `x`. Where the GPU's product rounds its input to bf16 (a 4-bit
+    /// matrix on tensor cores, see [`super::ops::rounds_input`]), so does this.
+    fn mv(&self, name: &str, shape: [usize; 2], x: &[f32]) -> Vec<f32> {
+        let w = self.w(name, &shape);
+        if self.ck.is_fp4(name) && super::ops::rounds_input(x.len()) {
+            let rounded: Vec<f32> = x.iter().map(|&v| bf16::from_f32(v).to_f32()).collect();
+            matvec(&w, &rounded)
+        } else {
+            matvec(&w, x)
+        }
+    }
+
     /// Feed `token` at `pos` (anything cached from `pos` on is dropped). Returns the logits
     /// and the residual stream after every layer.
     pub fn feed(&mut self, pos: usize, token: i32) -> (Vec<f32>, Vec<Vec<f32>>) {
@@ -126,9 +140,9 @@ impl<'a> RefTarget<'a> {
                 &self.w(&p("input_layernorm"), &[hidden]),
                 c.rms_norm_eps,
             );
-            let mut q = matvec(&self.w(&p("self_attn.q_proj"), &[q_dim, hidden]), &xn);
-            let mut k = matvec(&self.w(&p("self_attn.k_proj"), &[kv_dim, hidden]), &xn);
-            let v = matvec(&self.w(&p("self_attn.v_proj"), &[kv_dim, hidden]), &xn);
+            let mut q = self.mv(&p("self_attn.q_proj"), [q_dim, hidden], &xn);
+            let mut k = self.mv(&p("self_attn.k_proj"), [kv_dim, hidden], &xn);
+            let v = self.mv(&p("self_attn.v_proj"), [kv_dim, hidden], &xn);
             rope(&mut q, &self.table, pos);
             rope(&mut k, &self.table, pos);
             self.keys[l].truncate(pos);
@@ -138,20 +152,17 @@ impl<'a> RefTarget<'a> {
             let a = attend(&q, &self.keys[l], &self.values[l], c.n_heads, c.n_kv_heads);
             add(
                 &mut h,
-                &matvec(&self.w(&p("self_attn.o_proj"), &[hidden, q_dim]), &a),
+                &self.mv(&p("self_attn.o_proj"), [hidden, q_dim], &a),
             );
             let xn = rms(
                 &h,
                 &self.w(&p("post_attention_layernorm"), &[hidden]),
                 c.rms_norm_eps,
             );
-            let g = matvec(&self.w(&p("mlp.gate_proj"), &[inter, hidden]), &xn);
-            let u = matvec(&self.w(&p("mlp.up_proj"), &[inter, hidden]), &xn);
+            let g = self.mv(&p("mlp.gate_proj"), [inter, hidden], &xn);
+            let u = self.mv(&p("mlp.up_proj"), [inter, hidden], &xn);
             let m: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| silu(g) * u).collect();
-            add(
-                &mut h,
-                &matvec(&self.w(&p("mlp.down_proj"), &[hidden, inter]), &m),
-            );
+            add(&mut h, &self.mv(&p("mlp.down_proj"), [hidden, inter], &m));
             after.push(h.clone());
         }
         let xn = rms(&h, &self.w("model.norm.weight", &[hidden]), c.rms_norm_eps);

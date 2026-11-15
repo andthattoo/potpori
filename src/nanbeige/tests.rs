@@ -141,6 +141,19 @@ fn rel_err(got: &[f32], want: &[f32]) -> f32 {
         / scale
 }
 
+/// How far a whole model may be from the plain-Rust reference. With f32 products the two agree
+/// to rounding error. Tensor-core products round their inputs to bf16, and although the
+/// reference rounds the same way, a value that sits on a rounding boundary can fall either
+/// side: one such input moves an output by a fraction of a percent, so only the kernels
+/// themselves are held to rounding error (`matrix_products_match_plain_arithmetic`).
+fn reference_tolerance() -> f32 {
+    if gpu().tensor_cores() {
+        2e-2
+    } else {
+        1e-4
+    }
+}
+
 /// The whole tiny target cut at its tapped layers, on this GPU.
 fn tapped(ck: &Checkpoint, range: (usize, usize), taps: &[usize]) -> TappedShards<Shard> {
     let parts = tap_ranges(range, taps)
@@ -235,9 +248,18 @@ fn check_target(ck: &Checkpoint) {
         .collect();
     let err = rel_err(&logits, &want);
     println!("[target] logits vs reference: relative error {err:.2e}");
-    assert!(err < 1e-4, "logits differ from the reference by {err}");
+    assert!(
+        err < reference_tolerance(),
+        "logits differ from the reference by {err}"
+    );
+    // The same pick, unless the reference's best two are closer than the error allowed above.
+    let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
     for (got, want) in logits.chunks(TINY.vocab).zip(want.chunks(TINY.vocab)) {
-        assert_eq!(argmax(got), argmax(want));
+        let (g, w) = (argmax(got) as usize, argmax(want) as usize);
+        assert!(
+            g == w || want[w] - want[g] < 2.0 * reference_tolerance() * top,
+            "picked {g}, the reference picks {w} by a clear margin"
+        );
     }
 
     // One token at a time: the same bits.
@@ -286,7 +308,7 @@ fn shards_cut_at_tapped_layers_equal_the_whole_model() {
         let want: Vec<f32> = after.iter().flat_map(|a| a[*layer].clone()).collect();
         let err = rel_err(tap, &want);
         assert!(
-            err < 1e-4,
+            err < reference_tolerance(),
             "layer {layer} tap differs from the reference by {err}"
         );
     }
@@ -331,7 +353,10 @@ fn drafter_matches_the_reference() {
     let got = draft.block_hidden(anchor, start);
     let err = rel_err(&got, &want);
     println!("[drafter] block hidden states vs reference: relative error {err:.2e}");
-    assert!(err < 1e-4, "drafter differs from the reference by {err}");
+    assert!(
+        err < reference_tolerance(),
+        "drafter differs from the reference by {err}"
+    );
 
     // The same block again gives the same bits, and the drafted tokens are what the
     // selector picks from the reference's hidden states.
@@ -355,7 +380,8 @@ fn drafter_matches_the_reference() {
             )
             .unwrap(),
     };
-    let want_tokens = selector.pick(anchor, &logits, &hp).unwrap();
+    let (ids, vals) = super::dflash::rank(&logits, dcfg.vocab, dcfg.selector_top_k);
+    let want_tokens = selector.pick(anchor, &ids, &vals, &hp).unwrap();
     let got_tokens = draft.draft(anchor, start).unwrap();
     println!("[drafter] drafted {got_tokens:?}");
     assert_eq!(got_tokens.len(), dcfg.block - 1);
@@ -574,4 +600,350 @@ fn streaming_layer_groups_through_the_gpu_equals_the_whole_model() {
     let mut chain = LocalChain::new(streamed, &[EOS_TOKEN]);
     let (got, _) = run_feature_decode(&mut draft, &mut chain, &tokens, 24).unwrap();
     assert_eq!(got, want);
+}
+
+/// Time of each kernel alone at the real model's sizes, and of queueing a whole pass against
+/// running it. Weights are random bytes (4-bit) or zeros (the output head): timing does not
+/// depend on their values.
+#[test]
+#[ignore = "needs an NVIDIA GPU with 4 GB free; prints timings"]
+fn bench_kernels() {
+    use super::ops::{self, Span};
+    let c = Config::NANBEIGE_4_3_33B;
+    let (hidden, inter) = (c.hidden, c.intermediate);
+    let (q_dim, kv_dim) = (c.q_dim(), c.kv_dim());
+    let max_seq = 1024;
+    let mut state = 0x9E37_79B9u64;
+    let mut bytes = |n: usize, lo: u8, span: u8| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                lo + (state >> 32) as u8 % span
+            })
+            .collect()
+    };
+    struct M {
+        w: Buf<u8>,
+        sc: Buf<u8>,
+        n_out: usize,
+        n_in: usize,
+    }
+    let mut mat = |n_out: usize, n_in: usize| M {
+        w: Buf::from_slice(&bytes(n_out * n_in / 2, 0, 255)),
+        sc: Buf::from_slice(&bytes(n_out * n_in / 16, 76, 51)),
+        n_out,
+        n_in,
+    };
+    let (wq, wk, wo) = (mat(q_dim, hidden), mat(kv_dim, hidden), mat(hidden, q_dim));
+    let (wg, wd) = (mat(inter, hidden), mat(hidden, inter));
+    let lm_head: Buf<u16> = Buf::zeros(c.vocab * hidden);
+    let mut rng = Rng(5);
+    let x: Buf<f32> = Buf::from_slice(&(0..8 * inter).map(|_| rng.next()).collect::<Vec<_>>());
+    let out: Buf<f32> = Buf::zeros(8 * 2 * inter);
+    let logits: Buf<f32> = Buf::zeros(8 * c.vocab);
+    let norm: Buf<f32> = Buf::from_slice(&vec![1.0f32; hidden]);
+    let rope = Buf::from_slice(&super::config::rope_table(c.rope_theta, max_seq));
+    let keys: Buf<f32> = Buf::zeros(max_seq * kv_dim);
+    let values: Buf<f32> = Buf::zeros(max_seq * kv_dim);
+    let scratch: Buf<f32> = Buf::zeros(8 * c.n_heads * max_seq);
+    let g = 1e-4f32;
+    let mul = |m: &M, s: usize| {
+        ops::gemm4(
+            out.ptr(),
+            x.ptr(),
+            &m.w,
+            &m.sc,
+            g,
+            m.n_out,
+            m.n_in,
+            s,
+            m.n_out,
+            false,
+        )
+    };
+    let time = |f: &dyn Fn()| -> f64 {
+        f();
+        gpu().sync();
+        let runs = 20;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            f();
+        }
+        gpu().sync();
+        t0.elapsed().as_secs_f64() * 1e3 / runs as f64
+    };
+    let pos = 512;
+    for s in [1usize, 8] {
+        let attn = || {
+            ops::attn(
+                out.ptr(),
+                x.ptr(),
+                &keys,
+                &values,
+                &scratch,
+                c.n_heads,
+                c.n_kv_heads,
+                Span::Causal { pos0: pos },
+                max_seq,
+                s,
+            )
+        };
+        let rows: [(&str, f64, usize); 10] = [
+            ("q or o product", time(&|| mul(&wq, s)), 2),
+            ("k or v product", time(&|| mul(&wk, s)), 2),
+            ("gate or up product", time(&|| mul(&wg, s)), 2),
+            ("down product", time(&|| mul(&wd, s)), 1),
+            (
+                "rmsnorm",
+                time(&|| ops::rmsnorm(out.ptr(), x.ptr(), &norm, 1e-5, hidden, s)),
+                2,
+            ),
+            (
+                "rope (q)",
+                time(&|| ops::rope(out.ptr(), &rope, c.n_heads, pos, s)),
+                1,
+            ),
+            ("attention at 512", time(&attn), 1),
+            (
+                "silu",
+                time(&|| ops::silu_mul(out.ptr(), x.ptr(), inter, s)),
+                1,
+            ),
+            (
+                "output head",
+                time(&|| {
+                    ops::gemm(
+                        logits.ptr(),
+                        x.ptr(),
+                        &lm_head,
+                        c.vocab,
+                        hidden,
+                        s,
+                        c.vocab,
+                        false,
+                    )
+                }),
+                0,
+            ),
+            ("(o product again)", time(&|| mul(&wo, s)), 0),
+        ];
+        let layer: f64 = rows.iter().map(|(_, ms, n)| ms * *n as f64).sum();
+        for (name, ms, n) in rows {
+            println!(
+                "[kernels] {s} tokens: {name:<20} {ms:7.3} ms x {n} = {:5.1}% of a layer",
+                100.0 * ms * n as f64 / layer
+            );
+        }
+        // One layer's launches, as `Shard::run` issues them, queued 52 times before waiting.
+        let pass = || {
+            for _ in 0..c.layers {
+                ops::rmsnorm(out.ptr(), x.ptr(), &norm, 1e-5, hidden, s);
+                mul(&wq, s);
+                mul(&wk, s);
+                mul(&wk, s);
+                ops::rope(out.ptr(), &rope, c.n_heads, pos, s);
+                ops::rope(out.ptr(), &rope, c.n_kv_heads, pos, s);
+                attn();
+                mul(&wo, s);
+                ops::rmsnorm(out.ptr(), x.ptr(), &norm, 1e-5, hidden, s);
+                mul(&wg, s);
+                mul(&wg, s);
+                ops::silu_mul(out.ptr(), x.ptr(), inter, s);
+                mul(&wd, s);
+            }
+        };
+        pass();
+        gpu().sync();
+        let t0 = Instant::now();
+        pass();
+        let queued = t0.elapsed().as_secs_f64() * 1e3;
+        gpu().sync();
+        let total = t0.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "[kernels] {s} tokens: a pass of {} layers: {queued:.1} ms to queue {} launches, \
+             {total:.1} ms until done (sum of kernels alone: {:.1} ms)",
+            c.layers,
+            13 * c.layers,
+            layer * c.layers as f64
+        );
+    }
+}
+
+/// The matrix products against plain arithmetic, on shapes that do not fill a tile: rows that
+/// are not a multiple of 16, token counts on both sides of 8, with and without accumulation.
+/// On cards with tensor cores this is what checks the operand layout.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn matrix_products_match_plain_arithmetic() {
+    use super::ops;
+    use super::weights::fp4_dense;
+    let mut rng = Rng(21);
+    let mut state = 0xC0FFEEu64;
+    let mut byte = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 32) as u8
+    };
+    for (n_out, n_in) in [(16usize, 16usize), (5, 48), (37, 256), (130, 1040)] {
+        let dense: Vec<f32> = (0..n_out * n_in).map(|_| rng.next() * 0.1).collect();
+        let bf: Vec<u16> = dense
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let bf_dense: Vec<f32> = bf
+            .iter()
+            .map(|&b| half::bf16::from_bits(b).to_f32())
+            .collect();
+        let packed: Vec<u8> = (0..n_out * n_in / 2).map(|_| byte()).collect();
+        let scales: Vec<u8> = (0..n_out * n_in / 16).map(|_| 76 + byte() % 51).collect();
+        let global = 3.1e-4f32;
+        let fp_dense = fp4_dense(&packed, &scales, global);
+        let (wb, wp, ws) = (
+            Buf::from_slice(&bf),
+            Buf::from_slice(&packed),
+            Buf::from_slice(&scales),
+        );
+        for s in [1usize, 2, 7, 8, 9, 19] {
+            let x: Vec<f32> = (0..s * n_in).map(|_| rng.next() * 3.0).collect();
+            let seen: Vec<f32> = if ops::rounds_input(n_in) {
+                x.iter()
+                    .map(|&v| half::bf16::from_f32(v).to_f32())
+                    .collect()
+            } else {
+                x.clone()
+            };
+            let xb = Buf::from_slice(&x);
+            let stride = n_out + 3;
+            for add in [false, true] {
+                let start: Vec<f32> = (0..s * stride).map(|_| rng.next()).collect();
+                let want = |w: &[f32], seen: &[f32]| -> Vec<f32> {
+                    let mut out = start.clone();
+                    for t in 0..s {
+                        for r in 0..n_out {
+                            let v: f64 = (0..n_in)
+                                .map(|j| w[r * n_in + j] as f64 * seen[t * n_in + j] as f64)
+                                .sum();
+                            let o = &mut out[t * stride + r];
+                            *o = if add { *o + v as f32 } else { v as f32 };
+                        }
+                    }
+                    out
+                };
+                let out = Buf::from_slice(&start);
+                ops::gemm(out.ptr(), xb.ptr(), &wb, n_out, n_in, s, stride, add);
+                let err = rel_err(&out.read(0, s * stride), &want(&bf_dense, &x));
+                assert!(
+                    err < 2e-6,
+                    "bf16 {n_out}x{n_in}, {s} tokens, add {add}: {err:e}"
+                );
+                let out = Buf::from_slice(&start);
+                ops::gemm4(
+                    out.ptr(),
+                    xb.ptr(),
+                    &wp,
+                    &ws,
+                    global,
+                    n_out,
+                    n_in,
+                    s,
+                    stride,
+                    add,
+                );
+                let err = rel_err(&out.read(0, s * stride), &want(&fp_dense, &seen));
+                assert!(
+                    err < 2e-6,
+                    "4-bit {n_out}x{n_in}, {s} tokens, add {add}: {err:e}"
+                );
+            }
+        }
+        // A token gives the same bits alone and at every place in a longer feed.
+        let s = 19;
+        let x: Vec<f32> = (0..s * n_in).map(|_| rng.next() * 3.0).collect();
+        let xb = Buf::from_slice(&x);
+        let (all_b, all_p): (Buf<f32>, Buf<f32>) = (Buf::zeros(s * n_out), Buf::zeros(s * n_out));
+        ops::gemm(all_b.ptr(), xb.ptr(), &wb, n_out, n_in, s, n_out, false);
+        ops::gemm4(
+            all_p.ptr(),
+            xb.ptr(),
+            &wp,
+            &ws,
+            global,
+            n_out,
+            n_in,
+            s,
+            n_out,
+            false,
+        );
+        let (all_b, all_p) = (all_b.read(0, s * n_out), all_p.read(0, s * n_out));
+        for t in 0..s {
+            let (one_b, one_p): (Buf<f32>, Buf<f32>) = (Buf::zeros(n_out), Buf::zeros(n_out));
+            ops::gemm(
+                one_b.ptr(),
+                xb.at(t * n_in),
+                &wb,
+                n_out,
+                n_in,
+                1,
+                n_out,
+                false,
+            );
+            ops::gemm4(
+                one_p.ptr(),
+                xb.at(t * n_in),
+                &wp,
+                &ws,
+                global,
+                n_out,
+                n_in,
+                1,
+                n_out,
+                false,
+            );
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&one_b.read(0, n_out)),
+                bits(&all_b[t * n_out..(t + 1) * n_out]),
+                "bf16 {n_out}x{n_in}: token {t} alone differs from in a feed"
+            );
+            assert_eq!(
+                bits(&one_p.read(0, n_out)),
+                bits(&all_p[t * n_out..(t + 1) * n_out]),
+                "4-bit {n_out}x{n_in}: token {t} alone differs from in a feed"
+            );
+        }
+    }
+    println!("[products] tensor cores: {}", gpu().tensor_cores());
+}
+
+/// The top-k kernel against the host ranking, on rows with repeated values so that ties are
+/// decided by index, and on a row that is not finite.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn top_k_on_the_gpu_matches_the_host() {
+    use super::dflash::rank;
+    use super::ops;
+    let mut rng = Rng(33);
+    for (vocab, k, rows) in [(320usize, 4usize, 7usize), (5000, 32, 3), (166_912, 32, 7)] {
+        // Coarse values: many exact ties, some of them between -0 and +0.
+        let mut logits: Vec<f32> = (0..rows * vocab)
+            .map(|_| (rng.next() * 40.0).round() / 4.0)
+            .collect();
+        logits[3] = -0.0;
+        let (want_ids, want_vals) = rank(&logits, vocab, k);
+        let (ids, vals): (Buf<i32>, Buf<f32>) = (Buf::zeros(rows * k), Buf::zeros(rows * k));
+        let on_gpu = Buf::from_slice(&logits);
+        ops::topk(&ids, &vals, on_gpu.ptr(), vocab, k, rows);
+        assert_eq!(ids.read(0, rows * k), want_ids, "{vocab} tokens, top {k}");
+        assert!(vals.read(0, rows * k) == want_vals);
+
+        logits[vocab + 5] = f32::NAN;
+        logits[2 * vocab + 9] = f32::INFINITY;
+        on_gpu.write(0, &logits);
+        ops::topk(&ids, &vals, on_gpu.ptr(), vocab, k, rows);
+        let got = ids.read(0, rows * k);
+        assert!(got[0] >= 0 && got[k] == -1 && got[2 * k] == -1);
+    }
 }

@@ -39,7 +39,8 @@ after a node drops.
 On an RTX 5080, with generated models of a few hundred channels (`cargo test … --ignored`):
 
 - The target, with bf16 and with 4-bit weights, and the drafter match plain-Rust
-  implementations written from the published architectures, to a relative error under 1e-6.
+  implementations written from the published architectures, to a relative error under 1e-6
+  (the 4-bit target on tensor cores to 0.4%; see below).
 - A token gives the same bits whether it is fed alone, inside a chunk, over a rejected draft,
   cut across shards, or with its layers streamed through the GPU a group at a time.
 - Drafted decoding equals plain greedy decoding, in one process and over a three-node QUIC
@@ -50,8 +51,22 @@ before network and the drafter:
 
 | Weights | One token | A chunk of eight (one drafted trip) |
 |---|---|---|
-| 4-bit | 0.60 ms per layer, 31 ms | 1.13 ms per layer, 59 ms |
-| bf16 | 1.7 ms per layer, 90 ms | 1.9 ms per layer, 97 ms |
+| 4-bit, tensor-core products (RTX 30 series and newer) | 0.7 ms per layer, 36 ms | 0.8 ms per layer, 42 ms |
+| 4-bit, scalar products (`POTPORI_NO_TC=1`, or an RTX 20-series card) | 0.54 ms per layer, 28 ms | 1.1 ms per layer, 56 ms |
+| bf16 | 1.6 ms per layer, 83 ms | 1.7 ms per layer, 89 ms |
+
+Timings vary by a few percent from run to run. The output head adds 3 ms per pass and the
+drafter 6 ms per block.
+
+On cards that have them, the 4-bit matrix products run on tensor cores
+([`cu/kernels_tc.cu`](cu/kernels_tc.cu)), which multiply bf16 by bf16: each product's input is
+rounded from f32 to bf16 first, as it is when the model is served in bf16 elsewhere. The
+residual stream, norms, attention and caches stay f32, and so do products with bf16 weights,
+which gain nothing from tensor cores. A node uses one kind of product for everything it runs,
+so the bit-for-bit properties above hold on either; nodes of a chain may differ. Against the
+plain-Rust reference, which rounds the same way, a whole 4-bit model on tensor cores agrees to
+0.4% rather than 1e-6: an input on a rounding boundary can fall either side. The kernel
+itself is checked against plain arithmetic to 2e-6.
 
 The 4-bit layout was checked against the published files: one matrix of layer 0, decoded as
 the kernel decodes it, differs from the same matrix in the bf16 repository by 14% (relative,
@@ -88,7 +103,7 @@ cargo build --locked --release
 `nvcc` needs MSVC's `cl.exe`: build from a Visual Studio developer prompt or set `NVCC_CCBIN`
 to its full path. The kernels are compiled to PTX for RTX 20-series cards and newer
 (`POTPORI_SM=sm_86` raises the floor). `POTPORI_GPU` picks the device when a machine has
-several.
+several, and `POTPORI_NO_TC=1` keeps the matrix products off tensor cores.
 
 ## Sizing a chain
 
@@ -192,13 +207,15 @@ The chain protocol is tested end to end over real QUIC with a synthetic shard: t
 three-node chains against greedy decoding, handshake refusals, malformed frames, and failing
 or vanishing nodes. The GPU tests are described under "What has been checked";
 `bench_real_size_layers` prints the per-layer timings (`POTPORI_BENCH_LAYERS` sets how many
-layers of random weights it loads).
+layers of random weights it loads) and `bench_kernels` the time of each kernel alone. Run the
+GPU tests once more with `POTPORI_NO_TC=1` to cover the scalar products.
 
 ## Layout
 
 | Path | What it holds |
 |---|---|
-| `cu/kernels.cu` | Every kernel: embedding, RMSNorm, the bf16 and 4-bit matrix products, RoPE, attention, the drafter's convolution. |
+| `cu/kernels.cu` | The kernels every card runs: embedding, RMSNorm, the bf16 and 4-bit matrix products, RoPE, attention, top-k, the drafter's convolution. |
+| `cu/kernels_tc.cu` | The 4-bit matrix product on tensor cores. |
 | `build.rs` | Compiles the kernels to PTX with `nvcc`. |
 | `src/gpu.rs` | The CUDA context, kernel launches and device buffers. |
 | `src/nanbeige/` | The model: geometry, checkpoint reader, tokenizer, the target shard, the drafter, single-GPU streaming, and the plain-Rust reference the tests compare against. |
