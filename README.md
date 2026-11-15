@@ -58,10 +58,20 @@ the kernel decodes it, differs from the same matrix in the bf16 repository by 14
 root mean square), the size of error 4-bit rounding gives; any other reading of the bytes is
 off by more than 100%.
 
-**Not yet run: the real weights end to end.** Nothing above loads a whole published
-checkpoint, so whether this implementation reproduces the model's text, and how many drafted
-tokens the target accepts, is unmeasured. `potpori local` exists to answer that on one
-machine. The 4-bit model is also a slightly different model from the original: its publisher
+With the published 4-bit weights and drafter, on one RTX 5080 through `potpori local`
+(greedy, no thinking block, one prompt each):
+
+| Prompt | Tokens | Tokens committed per trip | The drafter's card, same weights |
+|---|---|---|---|
+| A Python function with tests | 160 | 2.96 | 2.37 (code) |
+| TCP against UDP | 160 | 1.72 | 1.53 (chat) |
+| Speculative decoding in a paragraph | 48 | 1.17 | 1.53 (chat) |
+
+The text is fluent and on topic in all three. Acceptance depends heavily on the kind of text:
+the drafter's card reports 2.9 for agentic coding and 1.4 to 1.5 for chat and Chinese.
+
+**Not yet run:** a chain of real machines with the real weights, and the bf16 weights end to
+end. The 4-bit model is also a slightly different model from the original: its publisher
 reports longer agentic runs and a small drop on a coding set.
 
 ## Build
