@@ -1,52 +1,109 @@
 # potpori
 
-Sharded Qwen3 inference across friends' GPUs, with greedy speculative decoding over
-authenticated QUIC connections.
+[Nanbeige4.3-33B](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) across your friends' NVIDIA
+gaming GPUs, in Rust and hand-written CUDA.
 
-Potpori is a Rust CLI on [Luminal](https://github.com/luminal-ai/luminal), pinned to upstream
-commit [`1cbb917`](https://github.com/luminal-ai/luminal/commit/1cbb9173dc53482bb6d87463aea2f1cfd94a1cf1).
+The model is 66 GB in bf16 and 22 GB in its
+[4-bit form](https://huggingface.co/ProCreations/Nanbeige4.3-33B-NVFP4-A16); no single gaming
+card holds either. Potpori cuts its 52 layers into contiguous ranges, one per machine, and
+passes the residual stream from machine to machine over authenticated QUIC connections. With
+the 4-bit weights, which are the default, two 16 GB cards are enough. A
+[DFlash2 drafter](https://huggingface.co/ProCreations/Nanbeige4.3-33B-DFlash2) on the first
+machine proposes seven tokens at a time, and the chain checks all of them in one trip.
+
+There is no ML framework underneath: the kernels are in [`cu/kernels.cu`](cu/kernels.cu),
+`build.rs` compiles them with `nvcc`, and the Rust side talks to the CUDA driver directly. The
+program runs this one model.
 
 ## How it works
 
 ```text
-head: tokenizer + embeddings + first layers + draft model
-  → middle: next layers → tail: final layers + output projection
-  ← verification results relayed back through the middle ←
+head: tokenizer + embedding + first layers + drafter
+  → middle: next layers → … → tail: last layers + output head
+  ← verification results and tapped hidden states relayed back ←
 ```
 
-A model is cut into contiguous layer ranges, one per machine. The head proposes several
-tokens with a small draft model; the chain checks them all in one pass and returns the target
-model's own greedy token at every position. Tokens that match are kept, the first mismatch is
-replaced by the target's token, and anything speculative after it is overwritten in each
-shard's KV cache. A wrong draft costs speed, never output: only the target's own picks are
-committed, and only a verified end-of-sequence token stops generation.
+The drafter never sees earlier tokens. It reads the target's own hidden states — the outputs
+of layers 1, 25 and 49, which travel back to the head with every result — and from them
+proposes a block of seven tokens in one pass. The chain runs the last settled token plus the
+seven drafts and returns the target's own greedy token at each position. Drafts that match are
+kept, the first mismatch is replaced by the target's token, and anything speculative after it
+is overwritten in each shard's KV cache. A wrong draft costs speed, never output: only the
+target's own picks are committed.
 
-Several verification chunks stay in flight at once (`depth`), so the machines work on
-different chunks at the same time and network round trips overlap with compute. Middle nodes
-forward new work without waiting for results. Results currently return through the chain.
+Decoding is greedy. Not built yet: sampling, multi-turn chat, NAT traversal, and reconnecting
+after a node drops.
 
-Supported models: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B` and `Qwen/Qwen3-4B`. Not built yet:
-other model families, sampling (decoding is greedy), NAT traversal, and reconnecting after a
-node drops. Output equals greedy decoding *of the same chain*; whether that matches a
-single-process run token for token depends on the backend's numerics and has to be checked
-per hardware setup.
+## What has been checked
+
+On an RTX 5080, with generated models of a few hundred channels (`cargo test … --ignored`):
+
+- The target, with bf16 and with 4-bit weights, and the drafter match plain-Rust
+  implementations written from the published architectures, to a relative error under 1e-6.
+- A token gives the same bits whether it is fed alone, inside a chunk, over a rejected draft,
+  cut across shards, or with its layers streamed through the GPU a group at a time.
+- Drafted decoding equals plain greedy decoding, in one process and over a three-node QUIC
+  chain on loopback.
+
+With layers of the real model's size and random weights, GPU time summed over all 52 layers,
+before network and the drafter:
+
+| Weights | One token | A chunk of eight (one drafted trip) |
+|---|---|---|
+| 4-bit | 0.60 ms per layer, 31 ms | 1.13 ms per layer, 59 ms |
+| bf16 | 1.7 ms per layer, 90 ms | 1.9 ms per layer, 97 ms |
+
+The 4-bit layout was checked against the published files: one matrix of layer 0, decoded as
+the kernel decodes it, differs from the same matrix in the bf16 repository by 14% (relative,
+root mean square), the size of error 4-bit rounding gives; any other reading of the bytes is
+off by more than 100%.
+
+**Not yet run: the real weights end to end.** Nothing above loads a whole published
+checkpoint, so whether this implementation reproduces the model's text, and how many drafted
+tokens the target accepts, is unmeasured. `potpori local` exists to answer that on one
+machine. The 4-bit model is also a slightly different model from the original: its publisher
+reports longer agentic runs and a small drop on a coding set.
 
 ## Build
 
-Current stable Rust (1.91 or newer) and the platform's native build tools.
+Current stable Rust (1.91 or newer), an NVIDIA driver, and the CUDA toolkit for `nvcc` (12.9 is
+what has been tested). No CUDA libraries are linked: only the driver is used, and it is opened
+at run time.
 
 ```sh
-cargo build --locked --release --features metal  # macOS / Apple Silicon
-cargo build --locked --release --features cuda   # NVIDIA
+cargo build --locked --release
 ```
 
-CUDA needs a compatible driver and the CUDA toolkit (headers including CCCL, NVRTC, cuBLAS)
-visible to the dynamic loader; 12.9 is what has been tested. `CUDA_PATH` / `CUDA_HOME`
-identify the toolkit, and `LUMINAL_CUDA_HEADERS_DIR` can point straight at its include
-directory. Without `nvcc`, set `CUDARC_CUDA_VERSION` (for example `12090` for 12.9).
+`nvcc` is found on `PATH` or under `CUDA_PATH`; set `NVCC` to point elsewhere. On Windows,
+`nvcc` needs MSVC's `cl.exe`: build from a Visual Studio developer prompt or set `NVCC_CCBIN`
+to its full path. The kernels are compiled to PTX for RTX 20-series cards and newer
+(`POTPORI_SM=sm_86` raises the floor). `POTPORI_GPU` picks the device when a machine has
+several.
 
-Both backends compute in F32. CUDA keeps the checkpoint's BF16 on the device; Metal has no BF16
-buffers, so weights are converted to F16 at load.
+## Sizing a chain
+
+| Piece | On the GPU |
+|---|---|
+| One layer, 4-bit, with a 4096-token cache | 0.34 GiB |
+| One layer, bf16, with a 4096-token cache | 1.13 GiB |
+| Embedding table (head) | 2.2 GiB |
+| Output head (tail, and the head for the drafter) | 2.2 GiB |
+| Drafter (head) | 1.7 GiB |
+
+The embedding table, the output head and the drafter are bf16 in both cases.
+
+**4-bit (default).** Two 16 GB cards cover the model: the head takes layers 0–19 (13.0 GiB
+with the drafter) and the tail layers 20–51 (13.1 GiB), as in `chain.example.toml`. A 16 GB
+card has 15.9 GiB and the desktop usually holds 1 to 2.5 GiB of it, so close what you can
+before starting, or lower `max_seq`. On Windows, a card that runs out of memory may spill into
+system memory and become very slow instead of failing: check the free memory each node logs
+after loading. On first run the head downloads about 16 GB (the drafter included) and the tail about 14 GB.
+
+**bf16 (`--weights bf16` on every node).** A 16 GB card serves about 12 middle layers, 10 as
+the tail, or 6 as the head: five such cards, or three 24 GB cards. The repository's 14 files
+mix layers freely, so expect most of the 66 GB on every machine.
+
+A chain cannot mix the two: nodes compare which weights they hold in the handshake.
 
 ## Establish peer trust
 
@@ -70,114 +127,82 @@ other paths.
 
 ## Run a chain
 
-Copy `chain.example.toml` to `chain.toml` on the head and edit the addresses. Start the tail,
-then the middle:
+Copy `chain.example.toml` to `chain.toml` on the head and edit the address. The remote machine
+must be reachable on its UDP port from the head: a VPN such as Tailscale or WireGuard between
+the machines, or a forwarded port. Start the tail:
 
 ```sh
-potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-  --layers 24:36 --role tail --chunk 8 --max-seq 768
+potpori serve --listen 0.0.0.0:4010 --layers 20:52 --role tail
+```
 
-potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-  --layers 12:24 --role middle --downstream 100.64.0.3:4010 \
-  --chunk 8 --max-seq 768
+With more than two machines, start each middle after the node it points to, last to first:
+
+```sh
+potpori serve --listen 0.0.0.0:4010 --layers 20:36 --role middle --downstream 100.64.0.3:4010
 ```
 
 Then the head:
 
 ```sh
-potpori chat --chain chain.toml --max-new 128 \
-  --prompt "Explain speculative decoding in one paragraph."
+potpori chat --chain chain.toml --max-new 128 --prompt "Explain speculative decoding in one paragraph."
 ```
 
-`--chunk` must equal `gamma + 1` and `--max-seq` must equal `max_seq` from the chain config.
-The prompt plus `--max-new` must fit in `max_seq`. A session starts with a handshake between
-each pair of neighbours; if a node was started with a different model, layer range, cache size
-or chunk size, `chat` fails at connect and says which node refused and which setting differs.
-A failure during generation is reported the same way.
+`--max-seq` on every node must equal `max_seq` from the chain config, and the prompt plus
+`--max-new` must fit in it. A session starts with a handshake between each pair of
+neighbours; if a node was started with a different layer range, cache size or tapped layers,
+`chat` fails at connect and says which node refused and which setting differs. The head waits
+up to 30 minutes for a node that is still downloading.
 
-The first run on each machine downloads the whole model, prepares the weights (streamed to a
-single file in the Hugging Face cache; allow disk for a second copy) and searches GPU kernels
-for the shard, which takes minutes. The head waits up to 15 minutes for a node that is still
-loading.
+`chat` ends with four lines of measurements: tokens per second, tokens committed per trip
+through the chain (draft acceptance), where the time went, the link's round trip and payload
+sizes, and the drafter's cost per block.
 
-`chat` ends with four lines of measurements:
+## One machine: `potpori local`
 
-```text
-[212 tokens in 21.4s = 9.9 tok/s overall, 11.6 tok/s after prefill | 2.71 tok/traversal over 78 traversals | γ=7 chain=2 nodes]
-[time: prefill 3.10s (41 prompt tokens) | head shard 4.20s | waiting on chain 9.80s | draft + rest 4.30s]
-[link: round trip 38.2 ms at connect, 36.9 ms now | 85 frames, 80.0 KiB each | head on metal]
-[draft model Qwen/Qwen3-0.6B, depth=4]
+```sh
+potpori local --max-new 32 --prompt "Write a haiku about sharing a GPU."
 ```
 
-`tok/traversal` is how many tokens each trip through the chain committed (draft acceptance).
-`--depth N` overrides the config for one run; comparing `--depth 1` with `--depth 4` shows
-what pipelining buys over a given link.
-
-For a first run between two machines, follow [docs/two-machine-test.md](docs/two-machine-test.md).
-
-### A drafter that reads the target
-
-Instead of a small draft model, the head can run a [DSpark](docs/dspark.md) drafter: a few
-extra layers that read the target's own hidden states and propose a block of seven tokens in
-one pass. Its guesses are better, but it cannot draft ahead, so one block is verified per
-trip and `depth` does not apply. Add `drafter = "deepseek-ai/dspark_qwen3_4b_block7"` to
-`chain.toml` and `--taps 1,9,17,25,33` to every `serve` command. This path has been checked
-on the CPU against the reference implementation but not yet on a GPU;
-[docs/dspark.md](docs/dspark.md) has the one-machine check to run first.
+This runs the whole model on a single GPU by loading a group of layers at a time (`--group`,
+16 by default in 4 bits and 4 in bf16) for every chunk, keeping only the KV caches, the
+embedding, the output head and the drafter resident. It copies every layer to the GPU again
+for each trip, so it is a check of the real weights and of draft acceptance, not a way to
+chat. It needs the whole checkpoint (22 GB in 4 bits, 66 GB with `--weights bf16`), the 2 GB
+drafter, and about 12 GiB of free GPU memory.
 
 ## Checks
 
 ```sh
-cargo test --locked                       # drivers, wire and chain protocol — no GPU
-cargo test --locked --features engine     # plus model and weight-preparation checks — no GPU
-cargo clippy --locked --features engine --all-targets -- -D warnings
-cargo test --locked --features reference cpu_check   # the real graphs on tiny models — CPU, minutes
+cargo test --locked                # drivers, wire, chain protocol, config, selector — no GPU
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --release -- --ignored --test-threads 1 --skip tokenizer   # GPU, seconds
 ```
 
 The chain protocol is tested end to end over real QUIC with a synthetic shard: two- and
 three-node chains against greedy decoding, handshake refusals, malformed frames, and failing
-or vanishing nodes.
-
-The `reference` feature runs the real Luminal graphs on Luminal's CPU executor with tiny
-models: the shard cut and KV rollback, and the tapped layers and DSpark drafter against
-outputs of transformers and DeepSpec (`tests/fixtures/dspark_tiny`).
-
-GPU tests are `#[ignore]`d and run by name:
-
-```sh
-# CUDA: tiny generated model, no download — shard equivalence and KV rollback
-cargo test --locked --release --features cuda native_cuda_tiny_shards_and_rollback -- --ignored --nocapture
-# Metal: real Qwen3-0.6B chain over loopback QUIC vs a single process
-cargo test --locked --release --features metal qwen_chain_equals_single_process -- --ignored --nocapture
-# Either backend: Qwen3-4B with its DSpark drafter over loopback QUIC vs greedy (11 GB download)
-cargo test --locked --release --features metal dspark_loopback -- --ignored --nocapture
-```
-
-The other Metal tests (`qwen_cut_2shard`, `qwen_pipelined_chain_equals_greedy`,
-`qwen_pipeline_throughput`, and the single-model tests in `src/qwen/target.rs`) run the same
-way. Metal execution has not been validated since the Luminal migration; see
-[the migration notes](docs/luminal-migration.md).
+or vanishing nodes. The GPU tests are described under "What has been checked";
+`bench_real_size_layers` prints the per-layer timings (`POTPORI_BENCH_LAYERS` sets how many
+layers of random weights it loads).
 
 ## Layout
 
 | Path | What it holds |
 |---|---|
+| `cu/kernels.cu` | Every kernel: embedding, RMSNorm, the bf16 and 4-bit matrix products, RoPE, attention, the drafter's convolution. |
+| `build.rs` | Compiles the kernels to PTX with `nvcc`. |
+| `src/gpu.rs` | The CUDA context, kernel launches and device buffers. |
+| `src/nanbeige/` | The model: geometry, checkpoint reader, tokenizer, the target shard, the drafter, single-GPU streaming, and the plain-Rust reference the tests compare against. |
 | `src/chain.rs` | The chain config file. |
 | `src/transport.rs` | Wire messages, framing, TLS identities, the handshake, the middle's relay. |
 | `src/node.rs` | The head, middle and tail roles, generic over a shard. |
-| `src/specpipe.rs`, `src/specdecode.rs` | The pipelined driver and the one-chunk-at-a-time reference driver. |
-| `src/qwen/` | Qwen3 on Luminal: graph, CUDA/Metal runtimes, weights, tokenizer, shard, draft. |
-| `src/specfeat.rs`, `src/qwen/dspark.rs` | The one-block-per-trip driver and the DSpark drafter it drives. |
-| `docs/dspark.md` | DSpark drafters for Qwen3: how they work, how potpori runs them, what has been checked. |
-| `tools/compare_drafts.py` | Measures both kinds of draft on one GPU (PyTorch). |
-| `docs/luminal-migration.md` | What changed with the current Luminal revision, and what has been validated. |
-| `docs/history/` | Earlier design notes, kept for the reasoning. |
+| `src/specfeat.rs` | The decoding driver: one drafted block per trip. |
+| `src/specpipe.rs`, `src/specdecode.rs` | Drivers for a draft model that reads tokens and can run ahead of the chain. Tested, not used by this drafter. |
 
 ## Lineage and license
 
-Inspired by [dnet](https://github.com/firstbatchxyz/dnet) and
-[shard](https://github.com/leyten/shard).
+Inspired by [dnet](https://github.com/firstbatchxyz/dnet),
+[shard](https://github.com/leyten/shard) and Baseten's
+[deepseek-ultrafast](https://github.com/basetenlabs/deepseek-ultrafast). The drafter's
+architecture follows its implementation in [SGLang](https://github.com/sgl-project/sglang).
 
-Apache-2.0. The runtime and memory adapters under `src/qwen/runtime/` are adapted from
-Luminal's MIT/Apache-2.0 examples at the pinned revision; see
-[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+Apache-2.0.

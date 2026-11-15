@@ -68,7 +68,7 @@ pub async fn read_framed<T: serde::de::DeserializeOwned>(
 // ---------------------------------------------------------------------------
 
 /// A residual-stream hidden state crossing a shard boundary: logically `[n_tokens, hidden]`,
-/// row-major, little-endian `dtype`. A verification chunk at Qwen3-4B width is about 80 KiB,
+/// row-major, little-endian `dtype`. A verification chunk of 8 tokens is 224 KiB,
 /// so the link is bound by round-trip time, not bandwidth.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HiddenStateFrame {
@@ -146,7 +146,7 @@ impl HiddenStateFrame {
 }
 
 /// The output of one tapped layer for every position of a chunk: `[n_tokens, hidden]`,
-/// row-major, as little-endian bf16. A feature-conditioned draft model (DSpark) reads these.
+/// row-major, as little-endian bf16. The drafter reads these.
 /// bf16 keeps f32's range at half the bytes; the precision only affects draft quality.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerTap {
@@ -743,7 +743,7 @@ mod tests {
         let client = dial_endpoint(&id).unwrap();
         let addr = server.local_addr().unwrap();
         let expected = SessionHello {
-            model: "qwen".into(),
+            model: "model".into(),
             next_layer: 12,
             max_seq: 768,
             chunk: 8,
@@ -962,8 +962,8 @@ mod tests {
     // of integers, which costs up to two bytes per byte.
     #[test]
     fn hidden_payload_is_compact_on_the_wire() {
-        let hidden = vec![-1.5f32; 8 * 2560]; // one verification chunk at Qwen3-4B width
-        let frame = PeerMessage::Hidden(HiddenStateFrame::from_f32(1, 0, 18, 8, 2560, &hidden));
+        let hidden = vec![-1.5f32; 8 * 7168]; // one verification chunk
+        let frame = PeerMessage::Hidden(HiddenStateFrame::from_f32(1, 0, 18, 8, 7168, &hidden));
         let bytes = rmp_serde::to_vec(&frame).unwrap();
         assert!(
             bytes.len() < hidden.len() * 4 + 64,

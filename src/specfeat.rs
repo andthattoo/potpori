@@ -1,6 +1,6 @@
 //! Greedy speculative decoding with a draft model that reads the target's hidden states.
 //!
-//! A feature-conditioned draft (DSpark) proposes a whole block of tokens in one pass, but it
+//! A feature-conditioned draft (DFlash) proposes a whole block of tokens in one pass, but it
 //! needs the target's tapped-layer outputs for every position before the block. Those only
 //! exist once the previous block has been through the whole chain, so this driver keeps one
 //! block in flight:

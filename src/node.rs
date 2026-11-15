@@ -50,7 +50,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_RETRY: Duration = Duration::from_secs(5);
 
 /// The compute a node contributes: a contiguous block of layers with its own KV cache.
-/// Implemented by the Luminal shard ([`crate::qwen::shard::Shard`]) and by the synthetic shard
+/// Implemented by [`crate::nanbeige::shard::Shard`] and by the synthetic shard
 /// in this module's tests.
 pub trait ShardEngine {
     /// What an adjacent node must agree on, for the boundary at `next_layer`.
@@ -387,7 +387,7 @@ pub struct ChainLink<S: ShardEngine> {
 
 impl<S: ShardEngine> ChainLink<S> {
     /// Dial the next node and run the handshake. Remote nodes come up at different times
-    /// (their kernel search takes minutes), so a node that does not answer is retried for up
+    /// (a first run downloads the checkpoint), so a node that does not answer is retried for up
     /// to `wait`. A node that answers and refuses — an untrusted certificate, a different
     /// build, or settings that do not match — fails immediately.
     pub fn connect(

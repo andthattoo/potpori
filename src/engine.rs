@@ -1,12 +1,12 @@
 //! Model-agnostic traits the speculative-decode drivers are written against.
 //!
 //! The drivers ([`crate::specdecode`], [`crate::specpipe`]) only see these traits, so their
-//! accept/reject logic is tested with synthetic engines — no Luminal, GPU or model needed.
-//! The real implementations are a small Qwen model on the head
-//! ([`crate::qwen::draft::IncrementalDraft`]) and the sharded target behind
+//! accept/reject logic is tested with synthetic engines — no GPU or model needed.
+//! [`DraftEngine`] is for a draft model that reads tokens; the drafter this program runs reads
+//! hidden states instead ([`crate::specfeat`]). The sharded target sits behind
 //! [`crate::node::ChainLink`].
 
-/// A vocabulary token id. Matches Luminal/HF conventions (i32).
+/// A vocabulary token id.
 pub type TokenId = i32;
 
 /// Greedy pick over one row of logits; `None` if the row is empty or has a non-finite value

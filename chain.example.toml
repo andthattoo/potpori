@@ -1,34 +1,31 @@
 # potpori chain config — copy to chain.toml and edit.
 #
-# The FIRST node is the head: it runs locally inside `potpori chat` (embeddings + its layer
-# block + the draft model + tokenizer). Every other node is remote, in pipeline order; the
-# LAST one is the tail (final norm + lm_head). Layer ranges must be contiguous.
+# The model is Nanbeige4.3-33B: 52 layers plus 2.2 GiB for the embedding table and 2.2 GiB for
+# the output head. With the default 4-bit weights a layer takes 0.34 GiB (weights and a
+# 4096-token cache), so two 16 GB cards hold the model, as below. With `--weights bf16` a
+# layer takes 1.2 GiB and the model needs five such cards.
+#
+# The FIRST node is the head: it runs locally inside `potpori chat` (embedding table + its
+# layers + the drafter, which needs the output head too: 6.2 GiB before any layer). Every
+# other node is remote, in pipeline order; the LAST one is the tail (final norm + output
+# head). Layer ranges must be contiguous and cover 0..52.
 #
 # Each remote friend runs `potpori serve` with a matching layer range, e.g. for this file:
-#   friend A (middle): potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-#                        --layers 12:24 --role middle --downstream 100.64.0.3:4010 --chunk 8 --max-seq 768
-#   friend B (tail):   potpori serve --listen 0.0.0.0:4010 --model Qwen/Qwen3-4B \
-#                        --layers 24:36 --role tail --chunk 8 --max-seq 768
-# (--chunk must equal gamma+1; --max-seq must match max_seq.)
+#   friend: potpori serve --listen 0.0.0.0:4010 --layers 20:52 --role tail
+# and a node between two others (three or more machines) adds
+#   --role middle --downstream <next node's address>
+# (--max-seq must match max_seq below if you change it.)
 # Generate an identity on each node and exchange public certificates as described in README.md.
+#
+# This split uses about 13.0 GiB on the head and 13.1 GiB on the tail. A 16 GB card has
+# 15.9 GiB, and the desktop usually holds 1 to 2.5 GiB of it: close what you can, or lower
+# max_seq (2048 saves 0.3 GiB on the head and 0.5 GiB on the tail).
 
-model = "Qwen/Qwen3-4B"          # target model (Qwen/Qwen3-{0.6B,1.7B,4B} for now)
-draft_model = "Qwen/Qwen3-0.6B"  # runs entirely on the head
-# Or a DSpark drafter for the target instead of a draft model (see docs/dspark.md). It reads
-# the target's hidden states, so every `potpori serve` also needs `--taps 1,9,17,25,33`
-# (`potpori chat` prints the list), and `depth` no longer applies:
-# drafter = "deepseek-ai/dspark_qwen3_4b_block7"
-gamma = 7                         # draft length per round; verify chunk = gamma+1 = 8
-max_seq = 768                     # KV size on every shard; prompt + max_new must fit
-depth = 4                         # verification chunks in flight (`chat --depth` overrides)
+max_seq = 4096     # KV size on every shard; prompt + max_new must fit
 
 [[nodes]]          # head — this machine (potpori chat)
-layers = [0, 12]
+layers = [0, 20]
 
-[[nodes]]          # friend A — middle
+[[nodes]]          # friend — tail
 addr = "100.64.0.2:4010"
-layers = [12, 24]
-
-[[nodes]]          # friend B — tail
-addr = "100.64.0.3:4010"
-layers = [24, 36]
+layers = [20, 52]
